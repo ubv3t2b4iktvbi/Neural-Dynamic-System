@@ -202,13 +202,13 @@ $$
 The more interesting scheme first learns modal coordinates
 
 $$
-a_t = \tanh\!\big(f_{\text{modal}}([h_t^{(q)}, h_t^{(m)}])\big) \in \mathbb{R}^K.
+a_t = \tanh(f_{\text{modal}}([h_t^{(q)}, h_t^{(m)}])) \in \mathbb{R}^K.
 $$
 
 Each mode gets a positive decay rate
 
 $$
-\lambda_k = \lambda_{\min}^{(q)} + \operatorname{softplus}(\theta_k),
+\lambda_k = \lambda_{\min}^{(q)} + \mathrm{softplus}(\theta_k),
 $$
 
 and the model constructs slow and memory weights from the log-spectrum:
@@ -276,8 +276,8 @@ This repository uses two complementary approximations to that idea.
 Given batch matrices $Q_0$ and $Q_\tau$ of whitened slow features from lagged windows, define centered versions
 
 $$
-\bar Q_0 = Q_0 - \operatorname{mean}(Q_0), \qquad
-\bar Q_\tau = Q_\tau - \operatorname{mean}(Q_\tau).
+\bar Q_0 = Q_0 - \mathrm{mean}(Q_0), \qquad
+\bar Q_\tau = Q_\tau - \mathrm{mean}(Q_\tau).
 $$
 
 Then
@@ -314,7 +314,7 @@ To encourage approximately decoupled slow coordinates, the time-lagged covarianc
 
 $$
 \mathcal{L}_{\text{diag}} =
-\left\| C_{0\tau} - \operatorname{diag}(C_{0\tau}) \right\|_F^2.
+\left\| C_{0\tau} - \mathrm{diag}(C_{0\tau}) \right\|_F^2.
 $$
 
 This is implemented by `_time_lag_covariance(...)` and `_offdiag_frobenius_loss(...)`.
@@ -329,7 +329,7 @@ $$
 
 $$
 \mathcal{L}_{\text{koopman}} =
-\operatorname{MSE}(a_{t+\tau}, a_{t+\tau}^{\text{pred}}).
+\mathrm{MSE}(a_{t+\tau}, a_{t+\tau}^{\text{pred}}).
 $$
 
 This is not a full Koopman eigenfunction theory, but it is a practical spectral bias that nudges the latent basis toward ordered relaxation modes.
@@ -352,11 +352,11 @@ $$
 Concretely, the implementation uses
 
 $$
-r_q(q,m) = r_{q,\min} + \operatorname{softplus}(f_{q,\text{rate}}(q,m)),
+r_q(q,m) = r_{q,\min} + \mathrm{softplus}(f_{q,\text{rate}}(q,m)),
 $$
 
 $$
-r_m(q,m) = r_{m,\min} + \operatorname{softplus}(f_{m,\text{rate}}(q,m)),
+r_m(q,m) = r_{m,\min} + \mathrm{softplus}(f_{m,\text{rate}}(q,m)),
 $$
 
 $$
@@ -421,15 +421,7 @@ Here
 - $B(q_t) \in \mathbb{R}^{d \times d_m}$ is a learned memory readout basis,
 - $B(q_t)m_t$ is the unresolved correction.
 
-In code:
-
-$$
-g(q) = \texttt{manifold\_decoder}(q),
-$$
-
-$$
-B(q) = \operatorname{reshape}(\texttt{memory\_readout\_net}(q)).
-$$
+In code, $g(q)$ is implemented by `manifold_decoder(q)`, and $B(q)$ is built by reshaping `memory_readout_net(q)`.
 
 So the final reconstruction is
 
@@ -476,7 +468,7 @@ The corresponding loss is
 $$
 \mathcal{L}_{\text{RG}}
 =
-\operatorname{MSE}\!\left(
+\mathrm{MSE}\left(
 \mathcal{C}(\Phi_{\Delta t}^{(h)}(z_t)),
 \Phi_{s\Delta t}^{(h)}(\mathcal{C}(z_t))
 \right).
@@ -507,7 +499,7 @@ The repository uses several consistency losses:
 $$
 \mathcal{L}_{\text{pred}}
 = \frac{1}{|\mathcal{H}|}\sum_{h \in \mathcal{H}}
-\operatorname{MSE}\!\left(D(\hat z_{t+h}), x_{t+h}\right).
+\mathrm{MSE}\left(D(\hat z_{t+h}), x_{t+h}\right).
 $$
 
 #### 8.2 Latent alignment
@@ -515,7 +507,7 @@ $$
 $$
 \mathcal{L}_{\text{latent-align}}
 = \frac{1}{|\mathcal{H}|}\sum_{h \in \mathcal{H}}
-\operatorname{MSE}\!\left(\hat z_{t+h}, z_{t+h}^{\text{enc}}\right).
+\mathrm{MSE}\left(\hat z_{t+h}, z_{t+h}^{\text{enc}}\right).
 $$
 
 #### 8.3 Slow-coordinate alignment
@@ -523,7 +515,7 @@ $$
 $$
 \mathcal{L}_{q\text{-align}}
 = \frac{1}{|\mathcal{H}|}\sum_{h \in \mathcal{H}}
-\operatorname{MSE}\!\left(\hat q_{t+h}, q_{t+h}^{\text{enc}}\right).
+\mathrm{MSE}\left(\hat q_{t+h}, q_{t+h}^{\text{enc}}\right).
 $$
 
 This is named `vamp_align_loss` in the training code.
@@ -533,7 +525,7 @@ This is named `vamp_align_loss` in the training code.
 For any $h_1, h_2, h_1+h_2 \in \mathcal{H}$,
 
 $$
-\Phi^{(h_2)}\!\left(z_{t+h_1}^{\text{enc}}\right)
+\Phi^{(h_2)}(z_{t+h_1}^{\text{enc}})
 \approx
 z_{t+h_1+h_2}^{\text{enc}}.
 $$
@@ -543,8 +535,8 @@ So the semigroup penalty is
 $$
 \mathcal{L}_{\text{semigroup}}
 =
-\operatorname{mean}_{h_1,h_2}
-\operatorname{MSE}\!\left(
+\mathrm{mean}_{h_1,h_2}
+\mathrm{MSE}\left(
 \Phi^{(h_2)}(z_{t+h_1}^{\text{enc}}),
 z_{t+h_1+h_2}^{\text{enc}}
 \right).
@@ -557,9 +549,9 @@ This encourages a genuinely dynamical latent representation rather than an arbit
 The implementation explicitly encourages the memory block to relax faster than the slow block. Let
 
 $$
-\bar r_q = \operatorname{mean}(r_q),
+\bar r_q = \mathrm{mean}(r_q),
 \qquad
-\bar r_m = \operatorname{mean}(r_m).
+\bar r_m = \mathrm{mean}(r_m).
 $$
 
 The separation gap is
@@ -572,7 +564,7 @@ The loss is
 
 $$
 \mathcal{L}_{\text{sep}} =
-\operatorname{ReLU}(\gamma_{\text{sep}} - \Delta_{\text{sep}}),
+\mathrm{ReLU}(\gamma_{\text{sep}} - \Delta_{\text{sep}}),
 $$
 
 where `separation_margin` is $\gamma_{\text{sep}}$.
@@ -606,7 +598,7 @@ The metric loss encourages the slow coordinates to preserve neighborhood geometr
 $$
 \mathcal{L}_{\text{metric}}
 =
-\operatorname{MSE}\!\left(
+\mathrm{MSE}\left(
 \widetilde D(W_i, W_j),
 \widetilde D(q_i, q_j)
 \right),
