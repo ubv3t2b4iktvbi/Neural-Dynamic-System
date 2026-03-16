@@ -6,40 +6,101 @@
 
 ```mermaid
 flowchart LR
-    W["输入窗口 W_t"] --> E["Encoder E"]
-    E --> UQ["slow summary u_t^(q)"]
-    E --> UH["fast summary u_t^(h)"]
+    classDef io fill:#f6efe4,stroke:#946c3b,stroke-width:1.5px,color:#2b2117;
+    classDef stage fill:#e9f2ea,stroke:#4f7d5c,stroke-width:1.5px,color:#142117;
+    classDef latent fill:#edf3fb,stroke:#4d709e,stroke-width:1.5px,color:#162338;
+    classDef dyn fill:#fff1e3,stroke:#c2762e,stroke-width:1.5px,color:#3f2411;
+    classDef aux fill:#f3edf8,stroke:#7b5ca6,stroke-width:1.5px,color:#251739;
 
-    UQ --> K["Koopman head K_theta"]
-    UH -. "soft_spectrum 时也输入" .-> K
-    K --> PRAW["raw Koopman features phi_t^raw"]
-    PRAW --> N["running whitening / channel norm"]
-    N --> PHI["Koopman features phi_t"]
+    subgraph ENC["Encoder"]
+        direction TB
+        W["输入窗口 W_t"]
+        E["Temporal encoder / MLP backbone E"]
+        W --> E
 
-    PHI --> Q["q_t = phi_t[:d_q]"]
-    PHI --> PF["phi_t^fast"]
-    UH --> HINIT["h head H_theta([u_t^(h), phi_t^fast])"]
-    PF --> HINIT
-    HINIT --> H["h_t"]
+        subgraph ESPLIT["多尺度 summary 拆分"]
+            direction LR
+            UQ["slow summary u_t^(q)"]
+            UH["fast summary u_t^(h)"]
+        end
 
-    subgraph STEP["一步 rollout"]
-        Q --> QSTEP["q: midpoint / RK2"]
-        H --> QSTEP
-        Q --> HGEN["A(q), b(q)"]
-        HGEN --> HSTEP["h: exact affine / exp step"]
-        H --> HSTEP
+        E --> UQ
+        E --> UH
     end
 
-    QSTEP --> ZNEXT["z_(t+1) = (q_(t+1), h_(t+1))"]
-    HSTEP --> ZNEXT
-    ZNEXT --> DEC["decoder: g(q) + D(q) h"]
-    DEC --> XH["重构 / 预测 x_hat"]
+    subgraph CORE["Latent Construction + Dynamics"]
+        direction TB
+        K["Koopman head K_theta"]
+        PRAW["raw Koopman features phi_t^raw"]
+        N["running whitening / channel norm"]
+        PHI["Koopman features phi_t"]
+        PF["phi_t^fast"]
+        Q["slow state q_t = phi_t[:d_q]"]
+        HINIT["hidden init H_theta([u_t^(h), phi_t^fast])"]
+        H["fast memory h_t"]
+        Z["latent state z_t = (q_t, h_t)"]
 
-    ZNEXT --> RG["RG branch only"]
-    RG --> RGQ["q_tilde = sqrt(lambda_q) * q"]
-    RG --> RGH["h_tilde = H_damp(q)^(-1/2) h"]
-    RGQ --> CG["coarse-grain C_s"]
-    RGH --> CG
+        subgraph STEP["One rollout step"]
+            direction LR
+            QSTEP["update q with midpoint / RK2"]
+            HGEN["build A(q), b(q)"]
+            HSTEP["update h with exact affine / exp step"]
+            QNEXT["q_(t+1)"]
+            HNEXT["h_(t+1)"]
+            ZNEXT["z_(t+1) = (q_(t+1), h_(t+1))"]
+
+            QSTEP --> QNEXT
+            HGEN --> HSTEP
+            HSTEP --> HNEXT
+            QNEXT --> ZNEXT
+            HNEXT --> ZNEXT
+        end
+    end
+
+    subgraph DEC["Decoder"]
+        direction TB
+        D["structured decoder g(q) + D(q) h"]
+        XH["重构 / 预测 x_hat"]
+        D --> XH
+    end
+
+    subgraph RGB["RG branch (loss only)"]
+        direction TB
+        RGQ["q_tilde = sqrt(lambda_q) * q"]
+        RGH["h_tilde = H_damp(q)^(-1/2) h"]
+        CG["coarse-grain C_s"]
+        RGQ --> CG
+        RGH --> CG
+    end
+
+    UQ --> K
+    UH -. "soft_spectrum 时也输入" .-> K
+    K --> PRAW --> N --> PHI
+    PHI --> Q
+    PHI --> PF
+    UH --> HINIT
+    PF --> HINIT
+    HINIT --> H
+    Q --> Z
+    H --> Z
+    Q --> QSTEP
+    H --> QSTEP
+    Q --> HGEN
+    H --> HSTEP
+    ZNEXT --> D
+    QNEXT --> RGQ
+    HNEXT --> RGH
+
+    class W,XH io;
+    class E,K,N,HINIT,D stage;
+    class UQ,UH,PRAW,PHI,PF,Q,H,Z,QNEXT,HNEXT,ZNEXT latent;
+    class QSTEP,HGEN,HSTEP dyn;
+    class RGQ,RGH,CG aux;
+
+    style ENC fill:#fbf7f0,stroke:#cbb18a,stroke-width:1.5px
+    style CORE fill:#f7f9fc,stroke:#aac0dd,stroke-width:1.5px
+    style DEC fill:#f7faf7,stroke:#a9c7b1,stroke-width:1.5px
+    style RGB fill:#faf6fc,stroke:#cbb5df,stroke-width:1.5px
 ```
 
 这个 README 只描述当前代码里真实实现的模型，不沿用旧的 `q,m` 文案。
