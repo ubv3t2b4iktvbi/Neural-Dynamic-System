@@ -310,6 +310,7 @@ def _loss_bundle(
     current_comp = model.encode_components(batch["window"], update_whitener=True)
     z0 = current_comp["z"]
     q0 = current_comp["q"]
+    koopman0 = current_comp["koopman"]
     stats0 = model.latent_statistics(z0)
 
     reconstruction = model.decode(z0)
@@ -323,18 +324,18 @@ def _loss_bundle(
     encoded_future = {horizon: comp["z"] for horizon, comp in future_components.items()}
     primary_horizon = train_cfg.horizons[0]
     lag_dt = float(train_cfg.dt) * float(primary_horizon)
-    q1_vamp = future_components[primary_horizon]["q"]
+    koopman1 = future_components[primary_horizon]["koopman"]
 
-    vamp_score = _vamp2_score(q0, q1_vamp)
-    vamp_loss = -vamp_score / float(max(model.cfg.q_dim, 1))
-    diag_loss = _offdiag_frobenius_loss(_time_lag_covariance(q0, q1_vamp))
+    vamp_score = _vamp2_score(koopman0, koopman1)
+    vamp_loss = -vamp_score / float(max(model.koopman_dim, 1))
+    diag_loss = _offdiag_frobenius_loss(_time_lag_covariance(koopman0, koopman1))
     koopman_loss = _koopman_consistency_loss(
-        current_comp["modal"],
-        future_components[primary_horizon]["modal"],
-        current_comp["modal_rates"],
+        current_comp["koopman"],
+        future_components[primary_horizon]["koopman"],
+        current_comp["koopman_rates"],
         dt=lag_dt,
     )
-    vamp_align_loss = _q_align_loss(model, rollout, future_components)
+    q_align_loss = _q_align_loss(model, rollout, future_components)
 
     pred_terms = [
         F.mse_loss(model.decode(rollout[horizon]), batch["future"][:, idx, :])
@@ -357,6 +358,8 @@ def _loss_bundle(
     memory_drive_mag = stats0["hidden_drive"].abs().mean()
     hidden_sym_eig_upper = stats0["hidden_sym_eig_upper"].mean()
     slow_residual_mag = stats0["slow_residual"].abs().mean()
+    koopman_rate_mean = current_comp["koopman_rates"].mean()
+    q_rate_mean = current_comp["q_rates"].mean()
 
     if loss_cfg.rg_weight > 0.0 and phase_scale["rg"] > 0.0:
         coarse_after_fine = model.coarse_grain(model.flow(z0, dt=train_cfg.dt, steps=train_cfg.rg_horizon))
@@ -396,7 +399,7 @@ def _loss_bundle(
     total = (
         loss_cfg.reconstruction_weight * rec_loss
         + loss_cfg.vamp_weight * vamp_loss
-        + loss_cfg.vamp_align_weight * vamp_align_loss
+        + loss_cfg.vamp_align_weight * q_align_loss
         + (loss_cfg.koopman_weight * phase_scale["koopman"]) * koopman_loss
         + (loss_cfg.diag_weight * phase_scale["diag"]) * diag_loss
         + (loss_cfg.prediction_weight * phase_scale["prediction"]) * pred_loss
@@ -416,7 +419,8 @@ def _loss_bundle(
         "vamp_score": vamp_score,
         "koopman_loss": koopman_loss,
         "diag_loss": diag_loss,
-        "vamp_align_loss": vamp_align_loss,
+        "q_align_loss": q_align_loss,
+        "vamp_align_loss": q_align_loss,
         "prediction_loss": pred_loss,
         "latent_align_loss": latent_align_loss,
         "semigroup_loss": semigroup_loss,
@@ -430,6 +434,8 @@ def _loss_bundle(
         "hidden_sym_eig_upper": hidden_sym_eig_upper,
         "slow_rate_mean": slow_scale.mean(),
         "memory_rate_mean": memory_scale.mean(),
+        "koopman_rate_mean": koopman_rate_mean,
+        "q_rate_mean": q_rate_mean,
         "slow_residual_mag": slow_residual_mag,
         "q_supervised_loss": q_supervised_loss,
         "h_supervised_loss": h_supervised_loss,
@@ -603,12 +609,15 @@ def fit_model(
         "best_val_koopman_loss": float(best_val_row["koopman_loss"]),
         "best_val_diag_loss": float(best_val_row["diag_loss"]),
         "best_val_prediction_loss": float(best_val_row["prediction_loss"]),
+        "best_val_q_align_loss": float(best_val_row["q_align_loss"]),
         "best_val_latent_align_loss": float(best_val_row["latent_align_loss"]),
         "best_val_semigroup_loss": float(best_val_row["semigroup_loss"]),
         "best_val_contract_loss": float(best_val_row["contract_loss"]),
         "best_val_separation_loss": float(best_val_row["separation_loss"]),
         "best_val_rg_loss": float(best_val_row["rg_loss"]),
         "best_val_hidden_l1_loss": float(best_val_row["hidden_l1_loss"]),
+        "best_val_koopman_rate_mean": float(best_val_row["koopman_rate_mean"]),
+        "best_val_q_rate_mean": float(best_val_row["q_rate_mean"]),
         "best_val_memory_rate_mean": float(best_val_row["memory_rate_mean"]),
         "best_val_slow_rate_mean": float(best_val_row["slow_rate_mean"]),
         "best_val_hidden_sym_eig_upper": float(best_val_row["hidden_sym_eig_upper"]),
@@ -621,10 +630,13 @@ def fit_model(
         "last_val_koopman_loss": float(last_val_row["koopman_loss"]),
         "last_val_diag_loss": float(last_val_row["diag_loss"]),
         "last_val_prediction_loss": float(last_val_row["prediction_loss"]),
+        "last_val_q_align_loss": float(last_val_row["q_align_loss"]),
         "last_val_semigroup_loss": float(last_val_row["semigroup_loss"]),
         "last_val_rg_loss": float(last_val_row["rg_loss"]),
         "last_val_contract_loss": float(last_val_row["contract_loss"]),
         "last_val_separation_loss": float(last_val_row["separation_loss"]),
+        "last_val_koopman_rate_mean": float(last_val_row["koopman_rate_mean"]),
+        "last_val_q_rate_mean": float(last_val_row["q_rate_mean"]),
         "last_val_memory_rate_mean": float(last_val_row["memory_rate_mean"]),
         "last_val_hidden_sym_eig_upper": float(last_val_row["hidden_sym_eig_upper"]),
         "last_val_supervised_total_loss": float(last_val_row["supervised_total_loss"]),
@@ -633,10 +645,13 @@ def fit_model(
         "best_phase3_val_koopman_loss": (float(best_phase3_row["koopman_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_diag_loss": (float(best_phase3_row["diag_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_prediction_loss": (float(best_phase3_row["prediction_loss"]) if best_phase3_row is not None else None),
+        "best_phase3_val_q_align_loss": (float(best_phase3_row["q_align_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_semigroup_loss": (float(best_phase3_row["semigroup_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_rg_loss": (float(best_phase3_row["rg_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_contract_loss": (float(best_phase3_row["contract_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_separation_loss": (float(best_phase3_row["separation_loss"]) if best_phase3_row is not None else None),
+        "best_phase3_val_koopman_rate_mean": (float(best_phase3_row["koopman_rate_mean"]) if best_phase3_row is not None else None),
+        "best_phase3_val_q_rate_mean": (float(best_phase3_row["q_rate_mean"]) if best_phase3_row is not None else None),
         "best_phase3_val_hidden_sym_eig_upper": (float(best_phase3_row["hidden_sym_eig_upper"]) if best_phase3_row is not None else None),
         "best_phase3_val_supervised_total_loss": (float(best_phase3_row["supervised_total_loss"]) if best_phase3_row is not None else None),
     }

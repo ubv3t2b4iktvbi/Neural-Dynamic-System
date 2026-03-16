@@ -36,6 +36,11 @@ def _matrix_inv_sqrt(mat: Tensor, eps: float = 1e-5) -> Tensor:
     return (evecs * inv_sqrt.unsqueeze(0)) @ evecs.transpose(-1, -2)
 
 
+def _softplus_inverse(value: float) -> float:
+    safe_value = max(float(value), 1e-6)
+    return math.log(math.expm1(safe_value))
+
+
 class _TemporalResBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int):
         super().__init__()
@@ -149,6 +154,8 @@ class LatentRGManifoldAutoencoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.latent_scheme = str(cfg.latent_scheme).lower()
+        self.koopman_dim = int(cfg.koopman_dim)
+        self.hidden_rank = min(int(cfg.hidden_rank), int(cfg.h_dim))
         flat_dim = int(cfg.input_dim) * int(cfg.context_len)
         encoder_type = str(cfg.encoder_type).lower()
 
@@ -164,38 +171,48 @@ class LatentRGManifoldAutoencoder(nn.Module):
             raise ValueError(f"Unknown encoder_type={cfg.encoder_type!r}")
 
         if self.latent_scheme == "soft_spectrum":
-            modal_input_dim = int(q_hidden_dim + fast_hidden_dim)
-            self.modal_backbone = nn.Sequential(
-                nn.LayerNorm(modal_input_dim),
-                _mlp(modal_input_dim, cfg.modal_dim, cfg.hidden_dim, 1),
-            )
-            self.modal_rate_logits = nn.Parameter(torch.linspace(-1.5, 1.5, steps=int(cfg.modal_dim)))
-            q_input_dim = int(cfg.modal_dim)
-            fast_input_dim = int(cfg.modal_dim)
+            koopman_input_dim = int(q_hidden_dim + fast_hidden_dim)
         else:
-            self.modal_backbone = None
-            self.modal_rate_logits = None
-            q_input_dim = int(q_hidden_dim)
-            fast_input_dim = int(fast_hidden_dim)
+            koopman_input_dim = int(q_hidden_dim)
 
-        self.vamp_head = nn.Sequential(
-            nn.LayerNorm(q_input_dim),
-            _mlp(q_input_dim, cfg.q_dim, cfg.hidden_dim, cfg.vamp_head_depth),
+        self.koopman_head = nn.Sequential(
+            nn.LayerNorm(koopman_input_dim),
+            _mlp(koopman_input_dim, self.koopman_dim, cfg.hidden_dim, cfg.vamp_head_depth),
         )
-        self.vamp_whitener = RunningWhitenedVAMP(
-            cfg.q_dim,
+        self.koopman_whitener = RunningWhitenedVAMP(
+            self.koopman_dim,
             momentum=cfg.vamp_whitening_momentum,
             eps=cfg.vamp_whitening_eps,
         )
-        self.h_head = nn.Linear(fast_input_dim, cfg.h_dim)
+        h_input_dim = int(fast_hidden_dim + self.koopman_dim)
+        self.h_head = nn.Sequential(
+            nn.LayerNorm(h_input_dim),
+            _mlp(h_input_dim, cfg.h_dim, cfg.hidden_dim, 1),
+        )
+
+        base_excess = max(float(cfg.min_slow_rate), 0.01)
+        self.koopman_rate_base_logit = nn.Parameter(torch.tensor(_softplus_inverse(base_excess), dtype=torch.float32))
+        if self.koopman_dim > 1:
+            rate_span = max(float(cfg.min_fast_rate - cfg.min_slow_rate), 0.05)
+            increment_init = max(rate_span / float(self.koopman_dim - 1), 0.01)
+            self.koopman_rate_step_logits = nn.Parameter(
+                torch.full((self.koopman_dim - 1,), _softplus_inverse(increment_init), dtype=torch.float32)
+            )
+        else:
+            self.koopman_rate_step_logits = None
 
         self.q_residual_net = _mlp(cfg.q_dim, cfg.q_dim, cfg.hidden_dim, cfg.depth)
-        self.q_rate_net = _mlp(cfg.q_dim, cfg.q_dim, cfg.hidden_dim, 1)
-        self.q_coupling_net = _mlp(cfg.q_dim, cfg.q_dim * cfg.h_dim, cfg.hidden_dim, 1)
+        self.q_coupling = nn.Linear(cfg.h_dim, cfg.q_dim, bias=False)
+        nn.init.normal_(self.q_coupling.weight, mean=0.0, std=0.05)
 
         self.h_rate_net = _mlp(cfg.q_dim, cfg.h_dim, cfg.hidden_dim, 1)
-        self.h_skew_net = _mlp(cfg.q_dim, cfg.h_dim * cfg.h_dim, cfg.hidden_dim, 1)
-        self.h_dissipation_net = _mlp(cfg.q_dim, cfg.h_dim * cfg.h_dim, cfg.hidden_dim, 1)
+        self.h_low_rank_gate = _mlp(cfg.q_dim, self.hidden_rank, cfg.hidden_dim, 1)
+        self.hidden_factors = nn.ParameterList(
+            [
+                nn.Parameter(torch.randn(cfg.h_dim, self.hidden_rank) * 0.05),
+                nn.Parameter(torch.randn(cfg.h_dim, self.hidden_rank) * 0.05),
+            ]
+        )
         self.h_drive_net = _mlp(cfg.q_dim, cfg.h_dim, cfg.hidden_dim, cfg.depth)
 
         self.manifold_decoder = _mlp(cfg.q_dim, cfg.input_dim, cfg.hidden_dim, cfg.depth)
@@ -215,11 +232,18 @@ class LatentRGManifoldAutoencoder(nn.Module):
         hidden = self.encoder_backbone(window.reshape(window.shape[0], -1))
         return hidden, hidden
 
+    def koopman_rates(self) -> Tensor:
+        base = self.cfg.min_slow_rate + F.softplus(self.koopman_rate_base_logit)
+        if self.koopman_rate_step_logits is None:
+            return base.unsqueeze(0)
+        steps = 1e-4 + F.softplus(self.koopman_rate_step_logits)
+        return torch.cat([base.unsqueeze(0), base + torch.cumsum(steps, dim=0)], dim=0)
+
+    def slow_koopman_rates(self) -> Tensor:
+        return self.koopman_rates()[: int(self.cfg.q_dim)]
+
     def modal_rates(self) -> Tensor:
-        if self.latent_scheme != "soft_spectrum" or self.modal_rate_logits is None:
-            ref = self.coarse_q_net[0].weight
-            return torch.zeros(0, device=ref.device, dtype=ref.dtype)
-        return self.cfg.min_slow_rate + F.softplus(self.modal_rate_logits)
+        return self.koopman_rates()
 
     def modal_weight_vectors(self, rates: Tensor) -> tuple[Tensor, Tensor]:
         if rates.numel() == 0:
@@ -233,14 +257,16 @@ class LatentRGManifoldAutoencoder(nn.Module):
 
     def spectrum_summary(self) -> dict[str, float | list[float] | str]:
         base_summary: dict[str, float | list[float] | str] = {
-            "latent_structure": "slow_fast_state_space",
+            "latent_structure": "koopman_q_plus_affine_hidden_ssm",
             "latent_scheme": self.latent_scheme,
             "integrator": "midpoint_q_plus_exact_affine_h",
+            "koopman_dim": int(self.koopman_dim),
+            "hidden_rank": int(self.hidden_rank),
+            "rg_transform": "rate_normalized_qh",
+            "hidden_operator_structure": "diagonal_plus_low_rank",
         }
-        if self.latent_scheme != "soft_spectrum":
-            return base_summary
         with torch.no_grad():
-            rates = self.modal_rates().detach().cpu()
+            rates = self.koopman_rates().detach().cpu()
             slow_weights, fast_weights = self.modal_weight_vectors(rates)
             norm = math.log(max(int(rates.numel()), 2))
             slow_entropy = float((-(slow_weights * (slow_weights + 1e-8).log()).sum() / norm).item())
@@ -248,6 +274,8 @@ class LatentRGManifoldAutoencoder(nn.Module):
             base_summary.update(
                 {
                     "modal_dim": int(rates.numel()),
+                    "koopman_rates": rates.tolist(),
+                    "q_slow_rates": rates[: int(self.cfg.q_dim)].tolist(),
                     "modal_rates": rates.tolist(),
                     "modal_rate_min": float(rates.min().item()),
                     "modal_rate_max": float(rates.max().item()),
@@ -266,43 +294,45 @@ class LatentRGManifoldAutoencoder(nn.Module):
         batch = window.shape[0]
         q_hidden, fast_hidden = self._encode_backbone(window)
         if self.latent_scheme == "soft_spectrum":
-            modal_input = torch.cat([q_hidden, fast_hidden], dim=-1)
-            modal = torch.tanh(self.modal_backbone(modal_input))
-            modal_rates = self.modal_rates().to(device=modal.device, dtype=modal.dtype)
-            slow_weights, fast_weights = self.modal_weight_vectors(modal_rates)
+            koopman_input = torch.cat([q_hidden, fast_hidden], dim=-1)
+            koopman_raw = self.koopman_head(koopman_input)
+            koopman_rates = self.koopman_rates().to(device=koopman_raw.device, dtype=koopman_raw.dtype)
+            slow_weights, fast_weights = self.modal_weight_vectors(koopman_rates)
             slow_weights_batch = slow_weights.unsqueeze(0).expand(batch, -1)
             fast_weights_batch = fast_weights.unsqueeze(0).expand(batch, -1)
-            q_source = modal * slow_weights_batch
-            fast_source = modal * fast_weights_batch
         else:
-            modal = self._zeros(batch, 0, q_hidden)
-            modal_rates = self._zeros(0, 0, q_hidden).reshape(0)
+            koopman_raw = self.koopman_head(q_hidden)
+            koopman_rates = self.koopman_rates().to(device=koopman_raw.device, dtype=koopman_raw.dtype)
             slow_weights_batch = self._zeros(batch, 0, q_hidden)
             fast_weights_batch = self._zeros(batch, 0, q_hidden)
-            q_source = q_hidden
-            fast_source = fast_hidden
 
-        q_raw = self.vamp_head(q_source)
-        q, q_vamp_raw = self.vamp_whitener(q_raw, update=update_whitener)
-        h = self.h_head(fast_source)
+        koopman, koopman_unwhitened = self.koopman_whitener(koopman_raw, update=update_whitener)
+        q = koopman[:, : int(self.cfg.q_dim)]
+        q_raw = koopman_unwhitened[:, : int(self.cfg.q_dim)]
+        if self.latent_scheme == "soft_spectrum":
+            fast_koopman = koopman * fast_weights_batch
+        else:
+            fast_koopman = koopman
+        h_input = torch.cat([fast_hidden, fast_koopman], dim=-1)
+        h = self.h_head(h_input)
         z = self.join_latent(q, h)
-        modal_rate_batch = (
-            modal_rates.unsqueeze(0).expand(batch, -1)
-            if modal_rates.numel() > 0
-            else self._zeros(batch, 0, q_hidden)
-        )
+        koopman_rate_batch = koopman_rates.unsqueeze(0).expand(batch, -1)
         return {
             "z": z,
             "q": q,
             "h": h,
             "m": h,
+            "koopman": koopman,
+            "koopman_raw": koopman_unwhitened,
+            "koopman_rates": koopman_rate_batch,
+            "q_rates": koopman_rate_batch[:, : int(self.cfg.q_dim)],
             "q_hidden": q_hidden,
             "h_hidden": fast_hidden,
             "memory_hidden": fast_hidden,
-            "q_raw": q_vamp_raw,
+            "q_raw": q_raw,
             "q_vamp": q,
-            "modal": modal,
-            "modal_rates": modal_rate_batch,
+            "modal": koopman,
+            "modal_rates": koopman_rate_batch,
             "modal_slow_weights": slow_weights_batch,
             "modal_fast_weights": fast_weights_batch,
             "modal_memory_weights": fast_weights_batch,
@@ -330,32 +360,30 @@ class LatentRGManifoldAutoencoder(nn.Module):
         q, h = self.split_latent(z)
         return self.decode_parts(q, h)
 
-    def _slow_coupling(self, q: Tensor, h: Tensor) -> tuple[Tensor, Tensor]:
-        coupling = self.q_coupling_net(q).view(q.shape[0], self.cfg.q_dim, self.cfg.h_dim)
-        coupling = coupling / math.sqrt(max(int(self.cfg.h_dim), 1))
-        value = torch.bmm(coupling, h.unsqueeze(-1)).squeeze(-1)
+    def _slow_coupling(self, h: Tensor) -> tuple[Tensor, Tensor]:
+        coupling = self.q_coupling.weight.unsqueeze(0).expand(h.shape[0], -1, -1)
+        value = self.q_coupling(h)
         return coupling, value
 
     def _hidden_operator(self, q: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         fast_rates = self.cfg.min_fast_rate + F.softplus(self.h_rate_net(q))
-        skew_raw = self.h_skew_net(q).view(q.shape[0], self.cfg.h_dim, self.cfg.h_dim)
-        skew = 0.5 * (skew_raw - skew_raw.transpose(-1, -2))
-        dissipation_raw = self.h_dissipation_net(q).view(q.shape[0], self.cfg.h_dim, self.cfg.h_dim)
-        dissipation = torch.bmm(dissipation_raw.transpose(-1, -2), dissipation_raw)
-        dissipation = dissipation / float(max(int(self.cfg.h_dim), 1))
-        operator = (self.cfg.hidden_operator_scale * skew) - dissipation - torch.diag_embed(fast_rates)
+        low_rank_coeffs = torch.tanh(self.h_low_rank_gate(q))
+        left = self.hidden_factors[0] / math.sqrt(max(self.hidden_rank, 1))
+        right = self.hidden_factors[1] / math.sqrt(max(self.hidden_rank, 1))
+        low_rank_update = torch.einsum("br,ir,jr->bij", low_rank_coeffs, left, right)
+        operator = (self.cfg.hidden_operator_scale * low_rank_update) - torch.diag_embed(fast_rates)
         sym = 0.5 * (operator + operator.transpose(-1, -2))
         sym_eig_upper = torch.linalg.eigvalsh(sym).amax(dim=-1, keepdim=True)
-        return operator, fast_rates, dissipation, sym_eig_upper
+        return operator, fast_rates, low_rank_coeffs, sym_eig_upper
 
     def latent_statistics(self, z: Tensor) -> dict[str, Tensor]:
         q, h = self.split_latent(z)
-        slow_rates = self.cfg.min_slow_rate + F.softplus(self.q_rate_net(q))
+        slow_rates = self.slow_koopman_rates().to(device=q.device, dtype=q.dtype).unsqueeze(0).expand_as(q)
         slow_residual = self.cfg.slow_residual_scale * torch.tanh(self.q_residual_net(q))
-        coupling_matrix, q_coupling = self._slow_coupling(q, h)
+        coupling_matrix, q_coupling = self._slow_coupling(h)
         dq = -(slow_rates * q) + slow_residual + q_coupling
 
-        hidden_operator, fast_rates, dissipation, hidden_sym_eig_upper = self._hidden_operator(q)
+        hidden_operator, fast_rates, hidden_low_rank_coeffs, hidden_sym_eig_upper = self._hidden_operator(q)
         hidden_drive = self.cfg.hidden_drive_scale * torch.tanh(self.h_drive_net(q))
         dh = torch.bmm(hidden_operator, h.unsqueeze(-1)).squeeze(-1) + hidden_drive
 
@@ -370,7 +398,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
             "q_coupling_matrix": coupling_matrix,
             "q_coupling": q_coupling,
             "hidden_operator": hidden_operator,
-            "hidden_dissipation": dissipation,
+            "hidden_low_rank_coeffs": hidden_low_rank_coeffs,
             "hidden_drive": hidden_drive,
             "hidden_sym_eig_upper": hidden_sym_eig_upper,
             "dq": dq,
@@ -394,7 +422,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
         return transition, bias
 
     def hidden_ssm_matrices(self, q: Tensor, *, dt: float) -> dict[str, Tensor]:
-        operator, fast_rates, dissipation, hidden_sym_eig_upper = self._hidden_operator(q)
+        operator, fast_rates, hidden_low_rank_coeffs, hidden_sym_eig_upper = self._hidden_operator(q)
         drive = self.cfg.hidden_drive_scale * torch.tanh(self.h_drive_net(q))
         transition, bias = self._affine_hidden_transition(operator, drive, dt=float(dt))
         return {
@@ -403,7 +431,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
             "bias": bias,
             "memory_rates": fast_rates,
             "fast_rates": fast_rates,
-            "hidden_dissipation": dissipation,
+            "hidden_low_rank_coeffs": hidden_low_rank_coeffs,
             "hidden_sym_eig_upper": hidden_sym_eig_upper,
             "hidden_drive": drive,
         }
@@ -440,27 +468,51 @@ class LatentRGManifoldAutoencoder(nn.Module):
         q, h = self.split_latent(z)
         return self.join_latent(q, torch.zeros_like(h))
 
-    def coarse_grain(self, z: Tensor) -> Tensor:
+    def rg_transform(self, z: Tensor) -> dict[str, Tensor]:
         q, h = self.split_latent(z)
+        fast_rates = self.cfg.min_fast_rate + F.softplus(self.h_rate_net(q))
+        q_rates = self.slow_koopman_rates().to(device=q.device, dtype=q.dtype).unsqueeze(0).expand_as(q)
+        q_scale = q_rates.clamp_min(float(self.cfg.rg_eps)).sqrt()
+        h_scale = fast_rates.clamp_min(float(self.cfg.rg_eps)).sqrt()
+        rg_q = q * q_scale
+        rg_h = h / h_scale
+        return {
+            "q": q,
+            "h": h,
+            "fast_rates": fast_rates,
+            "q_rates": q_rates,
+            "q_scale": q_scale,
+            "h_scale": h_scale,
+            "rg_q": rg_q,
+            "rg_h": rg_h,
+        }
+
+    def coarse_grain(self, z: Tensor) -> Tensor:
         scale = max(self.cfg.rg_scale, 1e-6)
-        delta_q = torch.tanh(self.coarse_q_net(q)) * (self.cfg.coarse_strength / scale)
-        coarse_q = q + delta_q
-        coarse_h = h / scale
+        rg = self.rg_transform(z)
+        cutoff = rg["q_rates"].amax(dim=-1, keepdim=True) / scale
+        centered = (
+            torch.log(cutoff.clamp_min(float(self.cfg.rg_eps)))
+            - torch.log(rg["q_rates"].clamp_min(float(self.cfg.rg_eps)))
+        ) / float(self.cfg.rg_temperature)
+        slow_mask = torch.sigmoid(centered)
+        delta_q = torch.tanh(self.coarse_q_net(rg["rg_q"])) * (self.cfg.coarse_strength / scale)
+        coarse_rg_q = slow_mask * rg["rg_q"] + delta_q
+        coarse_rg_h = rg["rg_h"] / scale
+        coarse_q = coarse_rg_q / rg["q_scale"]
+        coarse_h = coarse_rg_h * rg["h_scale"]
         return self.join_latent(coarse_q, coarse_h)
 
     def module_groups(self) -> dict[str, list[nn.Module]]:
-        encoder_modules: list[nn.Module] = [self.encoder_backbone, self.vamp_head, self.h_head]
-        if self.modal_backbone is not None:
-            encoder_modules.append(self.modal_backbone)
+        encoder_modules: list[nn.Module] = [self.encoder_backbone, self.koopman_head, self.h_head]
 
         decoder_modules: list[nn.Module] = [self.manifold_decoder, self.hidden_readout_net]
         dynamics_modules: list[nn.Module] = [
             self.q_residual_net,
-            self.q_rate_net,
-            self.q_coupling_net,
+            self.q_coupling,
             self.h_rate_net,
-            self.h_skew_net,
-            self.h_dissipation_net,
+            self.h_low_rank_gate,
+            self.hidden_factors,
             self.h_drive_net,
         ]
 

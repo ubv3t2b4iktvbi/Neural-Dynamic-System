@@ -10,6 +10,7 @@ class ModelConfig:
     q_dim: int = 2
     h_dim: int = 2
     m_dim: int | None = None
+    koopman_dim: int | None = None
     latent_scheme: str = "soft_spectrum"
     modal_dim: int = 8
     modal_temperature: float = 0.35
@@ -24,11 +25,14 @@ class ModelConfig:
     min_slow_rate: float = 0.02
     min_fast_rate: float = 0.15
     min_memory_rate: float | None = None
+    hidden_rank: int = 4
     hidden_operator_scale: float = 0.10
     hidden_drive_scale: float = 0.50
     slow_residual_scale: float = 0.50
     rg_scale: float = 2.0
     coarse_strength: float = 0.25
+    rg_temperature: float = 0.35
+    rg_eps: float = 1e-4
 
     def __post_init__(self) -> None:
         self.latent_scheme = str(self.latent_scheme).lower()
@@ -39,6 +43,11 @@ class ModelConfig:
                 self.h_dim = int(self.m_dim)
         if self.min_memory_rate is not None:
             self.min_fast_rate = float(self.min_memory_rate)
+        if self.koopman_dim is None:
+            default_koopman_dim = max(int(self.q_dim), int(self.modal_dim))
+            self.koopman_dim = default_koopman_dim
+        self.koopman_dim = int(self.koopman_dim)
+        self.hidden_rank = min(int(self.hidden_rank), int(self.h_dim))
 
         if self.latent_scheme not in {"hard_split", "soft_spectrum"}:
             raise ValueError("latent_scheme must be 'hard_split' or 'soft_spectrum'")
@@ -50,20 +59,29 @@ class ModelConfig:
             raise ValueError("q_dim must be >= 1")
         if int(self.h_dim) < 1:
             raise ValueError("h_dim must be >= 1")
+        if int(self.koopman_dim) < int(self.q_dim):
+            raise ValueError("koopman_dim must be >= q_dim")
         if float(self.min_fast_rate) <= 0.0:
             raise ValueError("min_fast_rate must be > 0")
         if float(self.min_slow_rate) <= 0.0:
             raise ValueError("min_slow_rate must be > 0")
+        if int(self.hidden_rank) < 1:
+            raise ValueError("hidden_rank must be >= 1")
         if float(self.hidden_operator_scale) < 0.0:
             raise ValueError("hidden_operator_scale must be >= 0")
         if float(self.hidden_drive_scale) < 0.0:
             raise ValueError("hidden_drive_scale must be >= 0")
         if float(self.slow_residual_scale) < 0.0:
             raise ValueError("slow_residual_scale must be >= 0")
+        if float(self.rg_temperature) <= 0.0:
+            raise ValueError("rg_temperature must be > 0")
+        if float(self.rg_eps) <= 0.0:
+            raise ValueError("rg_eps must be > 0")
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
         payload["h_dim"] = int(self.h_dim)
+        payload["koopman_dim"] = int(self.koopman_dim)
         payload.pop("m_dim", None)
         payload["min_fast_rate"] = float(self.min_fast_rate)
         payload.pop("min_memory_rate", None)

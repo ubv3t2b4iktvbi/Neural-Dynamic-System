@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window", type=int, default=32)
     parser.add_argument("--q_dim", type=int, default=2)
     parser.add_argument("--h_dim", "--m_dim", dest="h_dim", type=int, default=2)
+    parser.add_argument("--koopman_dim", type=int, default=None)
     parser.add_argument("--latent_scheme", type=str, default="soft_spectrum", choices=["hard_split", "soft_spectrum"])
     parser.add_argument("--modal_dim", type=int, default=8)
     parser.add_argument("--modal_temperature", type=float, default=0.35)
@@ -100,6 +101,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rg_horizon", type=int, default=1)
     parser.add_argument("--rg_scale", type=float, default=2.0)
     parser.add_argument("--coarse_strength", type=float, default=0.25)
+    parser.add_argument("--hidden_rank", type=int, default=4)
+    parser.add_argument("--rg_temperature", type=float, default=0.35)
     parser.add_argument("--q_label_indices", nargs="*", type=int, default=None)
     parser.add_argument("--h_label_indices", "--m_label_indices", dest="h_label_indices", nargs="*", type=int, default=None)
     parser.add_argument("--q_supervised_weight", type=float, default=0.0)
@@ -275,7 +278,7 @@ def _collect_latents(
     batch_size: int,
 ) -> dict[str, np.ndarray]:
     loader = DataLoader(dataset, batch_size=int(batch_size), shuffle=False)
-    outputs = {"q": [], "h": [], "z": []}
+    outputs = {"koopman": [], "q": [], "h": [], "z": []}
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -367,6 +370,7 @@ def _label_probe(
         "val_episodes": int(len(val_episodes)),
         "target_names": label_names,
         "latent_dims": {
+            "koopman": int(model_cfg.koopman_dim),
             "q": int(model_cfg.q_dim),
             "h": int(model_cfg.h_dim),
             "z": int(model_cfg.q_dim + model_cfg.h_dim),
@@ -527,6 +531,7 @@ def main() -> None:
         context_len=args.window,
         q_dim=args.q_dim,
         h_dim=args.h_dim,
+        koopman_dim=args.koopman_dim,
         latent_scheme=args.latent_scheme,
         modal_dim=args.modal_dim,
         modal_temperature=args.modal_temperature,
@@ -538,8 +543,10 @@ def main() -> None:
         vamp_head_depth=args.vamp_head_depth,
         vamp_whitening_momentum=args.vamp_whitening_momentum,
         vamp_whitening_eps=args.vamp_whitening_eps,
+        hidden_rank=args.hidden_rank,
         rg_scale=args.rg_scale,
         coarse_strength=args.coarse_strength,
+        rg_temperature=args.rg_temperature,
     )
     train_cfg = TrainConfig(
         epochs=int(curriculum_cfg["epochs"]),
@@ -682,7 +689,9 @@ def main() -> None:
         )
     if probe_summary is not None:
         z_mean_r2 = probe_summary["block_probe_r2"]["z"]["mean_r2"]
+        koopman_mean_r2 = probe_summary["block_probe_r2"]["koopman"]["mean_r2"]
         q_mean_r2 = probe_summary["block_probe_r2"]["q"]["mean_r2"]
+        print(f"held-out probe mean R2 (koopman): {koopman_mean_r2:.6f}")
         print(f"held-out probe mean R2 (z): {z_mean_r2:.6f}")
         print(f"held-out probe mean R2 (q): {q_mean_r2:.6f}")
     print(f"results saved under: {out_dir}")
