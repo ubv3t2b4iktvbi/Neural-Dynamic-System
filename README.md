@@ -17,6 +17,19 @@
 - `h`：`q` 条件化的 affine hidden SSM / memory state
 - `\hat x`：由 `g(q) + D(q) h` 生成的重构或预测
 
+## 和常见模型路线相比，这个设计想突出什么
+
+下面这个对比是“结构差异”而不是 benchmark 排名。它想说明的不是别的方法都不行，而是当前实现特意把哪些性质做成了模型本身的一部分。
+
+| 路线 | 典型做法 | 常见问题 | 当前实现强调的点 |
+| --- | --- | --- | --- |
+| 黑箱 autoencoder / latent ODE | 一个统一 latent，加一个通用向量场或 RNN | 慢快分工通常要靠后验分析，latent 语义容易混在一起 | `q` 和 `h` 从一开始就分工，`h` 也不是任意黑箱 ODE，而是 affine hidden SSM |
+| 纯 Koopman autoencoder | 显式谱坐标，强调线性或近线性推进 | 容易把闭合误差、短时记忆、局部修正都挤进同一组谱坐标 | `q` 只承接慢模态，`h` 专门承担 closure / memory / fast correction |
+| 纯 SSM / Mamba 类模型 | 强状态递推、强扫描友好性 | 状态往往缺少清晰的几何和谱语义 | 我们保留显式 Koopman slow coordinates、结构化 decoder、RG/semigroup 分支 |
+| 仓库里的 legacy 变体 | `joint` Koopman 输入 + `direct` hidden 坐标 | `phi/q` 和 fast correction 更容易纠缠 | 推荐几何版本把 Koopman 输入限制在 slow summary，并把 `h` 放到 normal residual 坐标里 |
+
+如果用一句话概括，这个模型想做的不是“再造一个更大的黑箱”，而是把可解释慢模态、闭合误差对应的快记忆、以及后续 SSD 化兼容性，尽量同时放进一个统一结构里。
+
 ## 什么是慢，什么是快
 
 这里的“快 / 慢”指的是 latent dynamics 的时间尺度，不是 encoder 通道深浅，也不是 `u^(q)` / `u^(h)` 这种实现里的中间 summary。
@@ -168,6 +181,27 @@ $$
 这里 `beta = hidden_drive_scale`。
 
 这意味着当前 `h` 子系统不是一个任意黑箱 ODE，而是一个稳定对角基座加低秩修正的仿射状态空间模型。
+
+## 哪些性质是模型设计自动实现的，哪些是 loss 在推动
+
+这个区分很重要，因为如果只写目标，很容易让人误以为所有性质都只是“希望学出来”。当前实现里，确实有一部分性质是由参数化和积分方式直接决定的。
+
+### 结构上直接成立的性质
+
+- `q` 直接取自显式 Koopman 特征 `phi` 的前 `q_dim` 维，不是另外再学一套没有谱含义的 slow latent。
+- Koopman 速率通过“正基值 + 正增量”的方式参数化，所以速率天然为正，而且按索引有序。
+- `h` 的连续时间方程始终是 `A(q) h + b(q)` 的 affine hidden SSM；其中 `A(q)` 始终是“负对角阻尼 + 条件低秩修正”。
+- `h` 的离散一步始终来自增广矩阵指数的 exact affine step，而不是普通显式积分器近似。
+- RG 谱归一化坐标只出现在 RG loss 分支，不会直接改写主干的 encoder、rollout、decoder 坐标。
+- 当 `hidden_coordinate_mode=normal_residual` 时，`h` 会先由 decoder 几何里的 normal residual 定义，再做一个小 refinement；也就是说，切向变化优先归给 `q`，法向补偿优先归给 `h`。
+
+### 仍然需要 loss 去推动的性质
+
+- `phi` 是否真的接近 time-lag Koopman 模态，要靠 VAMP、time-lag diagonalization、Koopman decay consistency 一起约束。
+- `h` 比 `q` 更快这件事不是完全自动的，要靠 separation loss 继续拉开平均速率间隔。
+- hidden operator 的整体收缩性不是完全由参数化硬保证的，要靠 contract loss 压住对称部谱上界。
+- `F_dt(F_dt(z)) \approx F_{2dt}(z)` 这类 semigroup 一致性，以及 coarse-grain 前后可交换性，要靠 semigroup loss 和 RG loss。
+- memory branch 不要无界膨胀，要靠 hidden L1 和预测/重构共同约束。
 
 ## 为什么 `q` 用 midpoint，而 `h` 用 exact affine step
 
@@ -393,6 +427,50 @@ $$
 
 也就是说，`soft_spectrum` 现在不再是旧版“`q,m` 两块 latent 的最终定义”，而是 Koopman feature construction 的方式。
 
+### `koopman_input_mode`
+
+当前支持：
+
+- `slow_only`
+- `joint`
+
+差别是：
+
+- `slow_only`：Koopman 头只吃 slow summary，等于先尽量把 `phi/q` 固定成“慢结构坐标”，再让 `h` 承担 short-memory 修正。
+- `joint`：Koopman 头同时看 slow/fast summary，表达力更强，但也更容易把快修正直接混进谱坐标。
+
+这是算法设计里的一个关键点：我们不是只做“是否显式建 Koopman 特征”的选择，而是进一步决定“快记忆能不能直接污染 Koopman 坐标”。
+
+### `hidden_coordinate_mode`
+
+当前支持：
+
+- `direct`
+- `normal_residual`
+
+差别是：
+
+- `direct`：直接从 fast summary 和 Koopman fast-side features 生成 `h`。这是最直接的 baseline，灵活，但 `h` 的几何语义更弱。
+- `normal_residual`：先用 `g(q)` 生成当前点在 slow manifold 上的 base，再把观测残差拆成 tangent 部分和 normal 部分，只把 normal residual 投到 hidden basis 上，最后做一个小 refine。
+
+`normal_residual` 的意义很大，因为很多模型想靠额外的正交损失去“希望”慢变量和快修正分工；这里是先通过坐标构造把这件事落实，再让训练去微调。
+
+## 仓库里现成的对比入口
+
+如果想把“我们的算法和现有变体的差异”落到可复现实验，而不是停留在概念层面，可以直接看 `scripts/vdp_suite.py` 里的四组配置：
+
+- `full_geometry_baseline`：`koopman_input_mode=joint`，`hidden_coordinate_mode=normal_residual`，`metric_mode=mahalanobis_dynamics`
+- `reduced_geometry`：`koopman_input_mode=slow_only`，`hidden_coordinate_mode=normal_residual`，`metric_mode=mahalanobis_dynamics`
+- `reduced_direct`：`koopman_input_mode=slow_only`，`hidden_coordinate_mode=direct`，`metric_mode=euclidean`
+- `reduced_geometry_semigroup_weak`：在 `reduced_geometry` 基础上削弱 semigroup 权重
+
+这组对照的价值在于，它没有把 backbone 整个换掉，而是尽量控制住其他因素，专门测试四件事：
+
+1. Koopman 头是否同时看 slow/fast summary，还是只看 slow summary。
+2. `h` 是否定义在 normal residual 坐标里。
+3. 度量约束是否从普通欧氏距离升级为更贴近局部动力学的 Mahalanobis 动态距离。
+4. semigroup 约束减弱后，结构化 rollout 的稳定性会掉多少。
+
 ## 当前训练目标
 
 ### 1. Reconstruction
@@ -596,6 +674,17 @@ python scripts/run_neural_dynamic_system.py --synthetic_kind toy
 - `h` 虽然已经 SSD-ready，但当前离散化还是 dense `matrix_exp`。
 - RG 仍然是一个 latent-level coarse-grain consistency prior，不是完整的 RG 理论程序。
 - 还没有涨落-耗散或随机项。
+
+## TODO / 后续工作
+
+- 加入更直接的 Koopman spectrum regularizer。
+  当前已经有 VAMP、time-lag diagonalization 和 modal decay consistency，但还缺少更显式的谱级约束，例如 spectral gap、慢模态簇稳定性，或对 Koopman 线性算子谱结构的直接正则。
+- 面向跨系统泛化的谱建模。
+  当前 slow-side Koopman rates 仍是全局共享参数；如果后续要覆盖参数变化较大或机理不完全一致的系统族，更合理的方向是共享谱模板加条件化偏移，或只共享相对谱排序 / 谱簇结构，而不是硬共享一套绝对谱值。
+- 探索 `q/h` 有效维度自适应。
+  当前 `q_dim` 和 `h_dim` 仍由人工指定；后续可以考虑基于门控、稀疏化、ARD、谱簇截断或其他容量控制机制，让 slow / fast 子空间更自动地贴近真实有效维度，而不是完全依赖手工调参。
+- 借鉴 MHC 风格的维度自动对齐设计。
+  如果后续实验继续表明 `q_dim / h_dim` 对结果较敏感，可以考虑把 slow / fast 子空间先设为容量上限，再通过可学习门控、活跃维度选择或簇级对齐，让模型更自动地贴近系统的真实有效维度，而不是只靠手动搜索超参数。
 
 ## 当前版本的最终描述
 

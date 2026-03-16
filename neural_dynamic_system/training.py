@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import random
 from dataclasses import dataclass
 from typing import Sequence
@@ -12,7 +13,13 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional at runtime
+    tqdm = None
+
 from .config import LossConfig, ModelConfig, SupervisionConfig, TrainConfig
+from .curriculum import build_phase_controller
 from .data import TrajectoryStats, prepare_datasets
 from .model import LatentRGManifoldAutoencoder
 
@@ -50,7 +57,20 @@ def _normalized_pairwise_distances(values: Tensor) -> Tensor:
     return dists / (dists.mean().detach() + 1e-6)
 
 
-def _metric_loss(windows: Tensor, q: Tensor, max_items: int) -> Tensor:
+def _matrix_inv(mat: Tensor, eps: float = 1e-5) -> Tensor:
+    evals, evecs = torch.linalg.eigh(mat)
+    inv = evals.clamp_min(eps).reciprocal()
+    return (evecs * inv.unsqueeze(-2)) @ evecs.transpose(-1, -2)
+
+
+def _normalized_pairwise_mahalanobis(values: Tensor, precision: Tensor) -> Tensor:
+    deltas = values.unsqueeze(1) - values.unsqueeze(0)
+    dists_sq = torch.einsum("ijd,df,ijf->ij", deltas, precision, deltas).clamp_min(0.0)
+    dists = dists_sq.sqrt()
+    return dists / (dists.mean().detach() + 1e-6)
+
+
+def _metric_loss_euclidean(windows: Tensor, q: Tensor, max_items: int) -> Tensor:
     count = windows.shape[0]
     if count <= 1:
         return windows.new_tensor(0.0)
@@ -59,6 +79,26 @@ def _metric_loss(windows: Tensor, q: Tensor, max_items: int) -> Tensor:
         windows = windows[idx]
         q = q[idx]
     window_dist = _normalized_pairwise_distances(windows)
+    latent_dist = _normalized_pairwise_distances(q)
+    return F.mse_loss(latent_dist, window_dist)
+
+
+def _metric_loss_mahalanobis(current: Tensor, future: Tensor, q: Tensor, max_items: int) -> Tensor:
+    count = current.shape[0]
+    if count <= 1:
+        return current.new_tensor(0.0)
+    if count > max_items:
+        idx = torch.randperm(count, device=current.device)[:max_items]
+        current = current[idx]
+        future = future[idx]
+        q = q[idx]
+    displacements = future - current
+    centered = displacements - displacements.mean(dim=0, keepdim=True)
+    denom = float(max(displacements.shape[0] - 1, 1))
+    cov = (centered.transpose(0, 1) @ centered) / denom
+    cov = cov + 1e-4 * torch.eye(cov.shape[0], device=cov.device, dtype=cov.dtype)
+    precision = _matrix_inv(cov, eps=1e-4)
+    window_dist = _normalized_pairwise_mahalanobis(current, precision)
     latent_dist = _normalized_pairwise_distances(q)
     return F.mse_loss(latent_dist, window_dist)
 
@@ -152,6 +192,12 @@ def _rollout_cache(
     return cache
 
 
+def _select_horizon_dict(values: dict[int, Tensor], horizons: tuple[int, ...]) -> dict[int, Tensor]:
+    if not horizons:
+        return {}
+    return {int(horizon): values[int(horizon)] for horizon in horizons if int(horizon) in values}
+
+
 def _latent_align_loss(
     rollout: dict[int, Tensor],
     encoded_future: dict[int, Tensor],
@@ -207,49 +253,6 @@ def _memory_contract_loss(hidden_sym_eig_upper: Tensor, *, margin: float) -> Ten
     return F.relu(hidden_sym_eig_upper + float(margin)).mean()
 
 
-def _phase_scales(phase: int) -> dict[str, float]:
-    if phase == 1:
-        return {
-            "koopman": 1.0,
-            "diag": 1.0,
-            "prediction": 0.0,
-            "latent_align": 0.0,
-            "semigroup": 0.0,
-            "contract": 0.0,
-            "separation": 0.0,
-            "rg": 0.0,
-        }
-    if phase == 2:
-        return {
-            "koopman": 1.0,
-            "diag": 1.0,
-            "prediction": 1.0,
-            "latent_align": 1.0,
-            "semigroup": 0.0,
-            "contract": 1.0,
-            "separation": 1.0,
-            "rg": 0.0,
-        }
-    return {
-        "koopman": 1.0,
-        "diag": 1.0,
-        "prediction": 1.0,
-        "latent_align": 1.0,
-        "semigroup": 1.0,
-        "contract": 1.0,
-        "separation": 1.0,
-        "rg": 1.0,
-    }
-
-
-def _curriculum_phase(progress: float, train_cfg: TrainConfig) -> int:
-    if progress < float(train_cfg.phase1_fraction):
-        return 1
-    if progress < float(train_cfg.phase2_fraction):
-        return 2
-    return 3
-
-
 def _set_trainability(model: LatentRGManifoldAutoencoder, *, dynamics_trainable: bool) -> None:
     for module in model.module_groups().get("dynamics", []):
         for param in module.parameters():
@@ -303,13 +306,13 @@ def _loss_bundle(
     loss_cfg: LossConfig,
     supervision_cfg: SupervisionConfig | None,
     *,
-    phase: int,
+    loss_scales: dict[str, float],
+    prediction_horizons: tuple[int, ...],
+    q_align_horizons: tuple[int, ...],
 ) -> dict[str, Tensor]:
     zero = batch["window"].new_tensor(0.0)
-    phase_scale = _phase_scales(phase)
     current_comp = model.encode_components(batch["window"], update_whitener=True)
     z0 = current_comp["z"]
-    q0 = current_comp["q"]
     koopman0 = current_comp["koopman"]
     stats0 = model.latent_statistics(z0)
 
@@ -335,13 +338,26 @@ def _loss_bundle(
         current_comp["koopman_rates"],
         dt=lag_dt,
     )
-    q_align_loss = _q_align_loss(model, rollout, future_components)
 
-    pred_terms = [
-        F.mse_loss(model.decode(rollout[horizon]), batch["future"][:, idx, :])
-        for idx, horizon in enumerate(train_cfg.horizons)
-    ]
-    pred_loss = torch.stack(pred_terms).mean() if pred_terms else zero
+    pred_by_horizon: dict[int, Tensor] = {}
+    for idx, horizon in enumerate(train_cfg.horizons):
+        pred_by_horizon[int(horizon)] = F.mse_loss(model.decode(rollout[horizon]), batch["future"][:, idx, :])
+    pred_loss = (
+        torch.stack([pred_by_horizon[horizon] for horizon in prediction_horizons]).mean()
+        if prediction_horizons
+        else zero
+    )
+    one_step_pred_loss = pred_by_horizon[int(primary_horizon)]
+    long_horizon = int(train_cfg.horizons[-1])
+    long_horizon_pred_loss = pred_by_horizon[long_horizon]
+    if q_align_horizons:
+        q_align_loss = _q_align_loss(
+            model,
+            _select_horizon_dict(rollout, q_align_horizons),
+            _select_horizon_dict(future_components, q_align_horizons),
+        )
+    else:
+        q_align_loss = zero
     latent_align_loss = _latent_align_loss(rollout, encoded_future)
     semigroup_loss = _semigroup_loss(model, encoded_future, dt=train_cfg.dt)
 
@@ -361,7 +377,7 @@ def _loss_bundle(
     koopman_rate_mean = current_comp["koopman_rates"].mean()
     q_rate_mean = current_comp["q_rates"].mean()
 
-    if loss_cfg.rg_weight > 0.0 and phase_scale["rg"] > 0.0:
+    if loss_cfg.rg_weight > 0.0 and float(loss_scales.get("rg", 0.0)) > 0.0:
         coarse_after_fine = model.coarse_grain(model.flow(z0, dt=train_cfg.dt, steps=train_cfg.rg_horizon))
         fine_after_coarse = model.flow(
             model.coarse_grain(z0),
@@ -372,7 +388,15 @@ def _loss_bundle(
     else:
         rg_loss = zero
 
-    metric_loss = _metric_loss(batch["flat_window"], stats0["q"], train_cfg.metric_subsample)
+    if loss_cfg.metric_mode == "euclidean":
+        metric_loss = _metric_loss_euclidean(batch["flat_window"], stats0["q"], train_cfg.metric_subsample)
+    else:
+        metric_loss = _metric_loss_mahalanobis(
+            batch["current"],
+            batch["future"][:, 0, :],
+            stats0["q"],
+            train_cfg.metric_subsample,
+        )
     q_current = current_comp["q_raw"] if (supervision_cfg is not None and supervision_cfg.q_mode == "angular") else current_comp["q"]
     q_future = {
         horizon: (comp["q_raw"] if (supervision_cfg is not None and supervision_cfg.q_mode == "angular") else comp["q"])
@@ -397,19 +421,19 @@ def _loss_bundle(
     )
 
     total = (
-        loss_cfg.reconstruction_weight * rec_loss
-        + loss_cfg.vamp_weight * vamp_loss
-        + loss_cfg.vamp_align_weight * q_align_loss
-        + (loss_cfg.koopman_weight * phase_scale["koopman"]) * koopman_loss
-        + (loss_cfg.diag_weight * phase_scale["diag"]) * diag_loss
-        + (loss_cfg.prediction_weight * phase_scale["prediction"]) * pred_loss
-        + (loss_cfg.latent_align_weight * phase_scale["latent_align"]) * latent_align_loss
-        + (loss_cfg.semigroup_weight * phase_scale["semigroup"]) * semigroup_loss
-        + (loss_cfg.contract_weight * phase_scale["contract"]) * contract_loss
-        + (loss_cfg.separation_weight * phase_scale["separation"]) * separation_loss
-        + (loss_cfg.rg_weight * phase_scale["rg"]) * rg_loss
-        + loss_cfg.metric_weight * metric_loss
-        + loss_cfg.hidden_l1_weight * memory_penalty
+        (loss_cfg.reconstruction_weight * float(loss_scales.get("reconstruction", 1.0))) * rec_loss
+        + (loss_cfg.vamp_weight * float(loss_scales.get("vamp", 1.0))) * vamp_loss
+        + (loss_cfg.vamp_align_weight * float(loss_scales.get("q_align", 1.0))) * q_align_loss
+        + (loss_cfg.koopman_weight * float(loss_scales.get("koopman", 1.0))) * koopman_loss
+        + (loss_cfg.diag_weight * float(loss_scales.get("diag", 1.0))) * diag_loss
+        + (loss_cfg.prediction_weight * float(loss_scales.get("prediction", 1.0))) * pred_loss
+        + (loss_cfg.latent_align_weight * float(loss_scales.get("latent_align", 1.0))) * latent_align_loss
+        + (loss_cfg.semigroup_weight * float(loss_scales.get("semigroup", 1.0))) * semigroup_loss
+        + (loss_cfg.contract_weight * float(loss_scales.get("contract", 1.0))) * contract_loss
+        + (loss_cfg.separation_weight * float(loss_scales.get("separation", 1.0))) * separation_loss
+        + (loss_cfg.rg_weight * float(loss_scales.get("rg", 1.0))) * rg_loss
+        + (loss_cfg.metric_weight * float(loss_scales.get("metric", 1.0))) * metric_loss
+        + (loss_cfg.hidden_l1_weight * float(loss_scales.get("hidden_l1", 1.0))) * memory_penalty
         + supervised_total_loss
     )
     return {
@@ -422,6 +446,8 @@ def _loss_bundle(
         "q_align_loss": q_align_loss,
         "vamp_align_loss": q_align_loss,
         "prediction_loss": pred_loss,
+        "one_step_prediction_loss": one_step_pred_loss,
+        "long_horizon_prediction_loss": long_horizon_pred_loss,
         "latent_align_loss": latent_align_loss,
         "semigroup_loss": semigroup_loss,
         "contract_loss": contract_loss,
@@ -448,18 +474,34 @@ def _run_epoch(
     model: LatentRGManifoldAutoencoder,
     loader: DataLoader,
     *,
+    epoch: int,
+    phase_name: str,
     device: torch.device,
     train_cfg: TrainConfig,
     loss_cfg: LossConfig,
     supervision_cfg: SupervisionConfig | None,
     optimizer: torch.optim.Optimizer | None,
     phase: int,
+    loss_scales: dict[str, float],
+    prediction_horizons: tuple[int, ...],
+    q_align_horizons: tuple[int, ...],
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
     totals: dict[str, float] = {}
     count = 0
-    for raw_batch in loader:
+    use_bar = bool(train_cfg.progress_bar) and tqdm is not None
+    split = "train" if is_train else "val"
+    iterator = loader
+    if use_bar:
+        iterator = tqdm(
+            loader,
+            total=len(loader),
+            desc=f"{split} {phase_name} e{epoch:03d}",
+            dynamic_ncols=True,
+            leave=False,
+        )
+    for batch_idx, raw_batch in enumerate(iterator, start=1):
         batch = _to_device(raw_batch, device=device)
         bundle = _loss_bundle(
             model,
@@ -467,7 +509,9 @@ def _run_epoch(
             train_cfg=train_cfg,
             loss_cfg=loss_cfg,
             supervision_cfg=supervision_cfg,
-            phase=phase,
+            loss_scales=loss_scales,
+            prediction_horizons=prediction_horizons,
+            q_align_horizons=q_align_horizons,
         )
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -479,6 +523,12 @@ def _run_epoch(
         count += batch_size
         for name, value in bundle.items():
             totals[name] = totals.get(name, 0.0) + float(value.detach().cpu()) * batch_size
+        if use_bar and (batch_idx == 1 or batch_idx % 10 == 0 or batch_idx == len(loader)):
+            iterator.set_postfix(
+                loss=f"{float(bundle['loss'].detach().cpu()):.4f}",
+                pred=f"{float(bundle['prediction_loss'].detach().cpu()):.4f}",
+                koop=f"{float(bundle['koopman_loss'].detach().cpu()):.4f}",
+            )
     return {name: total / max(count, 1) for name, total in totals.items()}
 
 
@@ -514,64 +564,167 @@ def fit_model(
         weight_decay=float(train_cfg.weight_decay),
     )
     base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    phase_controller = build_phase_controller(train_cfg)
 
     history_rows: list[dict[str, float | int | str]] = []
-    best_state_by_phase: dict[int, dict[str, Tensor]] = {1: copy.deepcopy(model.state_dict())}
-    best_val_by_phase: dict[int, float] = {1: float("inf")}
+    best_state_by_phase: dict[int, dict[str, Tensor]] = {0: copy.deepcopy(model.state_dict())}
+    best_val_by_phase: dict[int, float] = {0: float("inf")}
+    schedule_events: list[dict[str, object]] = []
+    early_stopping_enabled = bool(train_cfg.early_stopping)
+    early_stopping_monitor = str(train_cfg.early_stopping_monitor)
+    early_stopping_patience = int(train_cfg.early_stopping_patience)
+    early_stopping_min_delta = float(train_cfg.early_stopping_min_delta)
+    if train_cfg.early_stopping_min_epochs is None:
+        if train_cfg.schedule_mode == "metric_driven":
+            early_stopping_min_epochs = (
+                int(train_cfg.phase0_min_epochs)
+                + int(train_cfg.phase1_min_epochs)
+                + int(train_cfg.phase2_min_epochs)
+            )
+        else:
+            early_stopping_min_epochs = max(
+                1,
+                int(math.ceil(float(train_cfg.epochs) * float(train_cfg.phase2_fraction))),
+            )
+    else:
+        early_stopping_min_epochs = int(train_cfg.early_stopping_min_epochs)
+    early_stopping_start_phase = int(train_cfg.early_stopping_start_phase)
+    best_early_stop_value: float | None = None
+    best_early_stop_epoch: int | None = None
+    early_stop_wait = 0
+    stop_reason: str | None = None
+    epochs_ran = 0
 
     for epoch in range(1, int(train_cfg.epochs) + 1):
-        progress = float(epoch) / float(max(int(train_cfg.epochs), 1))
-        phase = _curriculum_phase(progress, train_cfg)
-        _set_trainability(model, dynamics_trainable=phase != 1)
+        epochs_ran = epoch
+        spec = phase_controller.current_spec(epoch)
+        phase = int(spec.phase)
+        phase_name = str(spec.name)
+        loss_scales = phase_controller.loss_scales(epoch)
+        prediction_horizons = phase_controller.prediction_horizons(epoch, train_cfg.horizons)
+        q_align_horizons = phase_controller.q_align_horizons(epoch, train_cfg.horizons)
+        _set_trainability(model, dynamics_trainable=bool(spec.dynamics_trainable))
         _set_optimizer_lr(
             optimizer,
             base_lrs,
-            scale=(float(train_cfg.phase3_lr_scale) if phase == 3 else 1.0),
+            scale=float(spec.lr_scale),
         )
         train_metrics = _run_epoch(
             model,
             train_loader,
+            epoch=epoch,
+            phase_name=phase_name,
             device=device,
             train_cfg=train_cfg,
             loss_cfg=loss_cfg,
             supervision_cfg=supervision_cfg,
             optimizer=optimizer,
             phase=phase,
+            loss_scales=loss_scales,
+            prediction_horizons=prediction_horizons,
+            q_align_horizons=q_align_horizons,
         )
-        val_metrics = _run_epoch(
-            model,
-            val_loader,
-            device=device,
-            train_cfg=train_cfg,
-            loss_cfg=loss_cfg,
-            supervision_cfg=supervision_cfg,
-            optimizer=None,
-            phase=phase,
+        should_validate = (
+            epoch == 1
+            or epoch % int(train_cfg.validation_interval) == 0
+            or epoch == int(train_cfg.epochs)
         )
+        val_metrics: dict[str, float] | None = None
+        history_rows.append(
+            {
+                "epoch": epoch,
+                "phase": phase,
+                "phase_name": phase_name,
+                "schedule_mode": str(train_cfg.schedule_mode),
+                "split": "train",
+                **train_metrics,
+            }
+        )
+        if should_validate:
+            val_metrics = _run_epoch(
+                model,
+                val_loader,
+                epoch=epoch,
+                phase_name=phase_name,
+                device=device,
+                train_cfg=train_cfg,
+                loss_cfg=loss_cfg,
+                supervision_cfg=supervision_cfg,
+                optimizer=None,
+                phase=phase,
+                loss_scales=loss_scales,
+                prediction_horizons=prediction_horizons,
+                q_align_horizons=q_align_horizons,
+            )
+            history_rows.append(
+                {
+                    "epoch": epoch,
+                    "phase": phase,
+                    "phase_name": phase_name,
+                    "schedule_mode": str(train_cfg.schedule_mode),
+                    "split": "val",
+                    **val_metrics,
+                }
+            )
 
-        history_rows.append({"epoch": epoch, "phase": phase, "split": "train", **train_metrics})
-        history_rows.append({"epoch": epoch, "phase": phase, "split": "val", **val_metrics})
+            if phase not in best_val_by_phase or val_metrics["loss"] < best_val_by_phase[phase]:
+                best_val_by_phase[phase] = val_metrics["loss"]
+                best_state_by_phase[phase] = copy.deepcopy(model.state_dict())
 
-        if phase not in best_val_by_phase or val_metrics["loss"] < best_val_by_phase[phase]:
-            best_val_by_phase[phase] = val_metrics["loss"]
-            best_state_by_phase[phase] = copy.deepcopy(model.state_dict())
+            phase_event = phase_controller.observe_validation(epoch, val_metrics)
+            if phase_event is not None:
+                schedule_events.append(phase_event.to_dict())
+                print(
+                    f"[schedule] epoch={epoch:03d} "
+                    f"{phase_event.action} {phase_event.from_phase}->{phase_event.to_phase} "
+                    f"{phase_event.reason}"
+                )
+                if phase_event.action == "rollback" and phase_event.to_phase in best_state_by_phase:
+                    model.load_state_dict(best_state_by_phase[phase_event.to_phase])
+
+            if early_stopping_enabled and phase >= early_stopping_start_phase and epoch >= early_stopping_min_epochs:
+                monitor_value = float(val_metrics[early_stopping_monitor])
+                if best_early_stop_value is None or monitor_value < (best_early_stop_value - early_stopping_min_delta):
+                    best_early_stop_value = monitor_value
+                    best_early_stop_epoch = epoch
+                    early_stop_wait = 0
+                else:
+                    early_stop_wait += 1
+                    if early_stop_wait >= early_stopping_patience:
+                        stop_reason = (
+                            f"no {early_stopping_monitor} improvement > {early_stopping_min_delta:g} "
+                            f"for {early_stopping_patience} validation check(s)"
+                        )
 
         if epoch == 1 or epoch % int(train_cfg.log_every) == 0 or epoch == int(train_cfg.epochs):
-            print(
-                f"[epoch {epoch:03d}] "
-                f"phase={phase} "
-                f"train={train_metrics['loss']:.5f} "
-                f"val={val_metrics['loss']:.5f} "
-                f"vamp={val_metrics['vamp_score']:.5f} "
-                f"koop={val_metrics['koopman_loss']:.5f} "
-                f"diag={val_metrics['diag_loss']:.5f} "
-                f"pred={val_metrics['prediction_loss']:.5f} "
-                f"align={val_metrics['latent_align_loss']:.5f} "
-                f"sg={val_metrics['semigroup_loss']:.5f} "
-                f"contract={val_metrics['contract_loss']:.5f} "
-                f"gap={val_metrics['separation_loss']:.5f} "
-                f"mem={val_metrics['hidden_l1_loss']:.5f}"
-            )
+            if val_metrics is None:
+                print(
+                    f"[epoch {epoch:03d}] "
+                    f"phase={phase}:{phase_name} "
+                    f"train={train_metrics['loss']:.5f} "
+                    "val=skipped"
+                )
+            else:
+                print(
+                    f"[epoch {epoch:03d}] "
+                    f"phase={phase}:{phase_name} "
+                    f"train={train_metrics['loss']:.5f} "
+                    f"val={val_metrics['loss']:.5f} "
+                    f"vamp={val_metrics['vamp_score']:.5f} "
+                    f"koop={val_metrics['koopman_loss']:.5f} "
+                    f"diag={val_metrics['diag_loss']:.5f} "
+                    f"pred={val_metrics['prediction_loss']:.5f} "
+                    f"pred1={val_metrics['one_step_prediction_loss']:.5f} "
+                    f"predL={val_metrics['long_horizon_prediction_loss']:.5f} "
+                    f"qalign={val_metrics['q_align_loss']:.5f} "
+                    f"sg={val_metrics['semigroup_loss']:.5f} "
+                    f"contract={val_metrics['contract_loss']:.5f} "
+                    f"gap={val_metrics['separation_loss']:.5f} "
+                    f"mem={val_metrics['hidden_l1_loss']:.5f}"
+                )
+        if stop_reason is not None:
+            print(f"[early-stop] epoch={epoch:03d} phase={phase} {stop_reason}")
+            break
 
     history = pd.DataFrame(history_rows)
     val_history = history[history["split"] == "val"].copy()
@@ -598,17 +751,22 @@ def fit_model(
             supervision_cfg is not None
             and (supervision_cfg.q_weight > 0.0 or supervision_cfg.h_weight > 0.0)
         ),
+        "schedule_mode": str(train_cfg.schedule_mode),
+        "schedule_event_count": int(len(schedule_events)),
+        "schedule_events": schedule_events,
         "latent_scheme": str(model.cfg.latent_scheme),
         "selection_phase": int(highest_phase),
         "overall_best_val_loss": float(overall_best_val_row["loss"]),
         "overall_best_val_phase": int(overall_best_val_row["phase"]),
-        "rg_active_epoch_count": int((val_history["phase"] == 3).sum()),
+        "rg_active_epoch_count": int((val_history["rg_loss"] > 0).sum()),
         "best_val_loss": float(best_val_row["loss"]),
         "best_val_phase": int(best_val_row["phase"]),
         "best_val_vamp_score": float(best_val_row["vamp_score"]),
         "best_val_koopman_loss": float(best_val_row["koopman_loss"]),
         "best_val_diag_loss": float(best_val_row["diag_loss"]),
         "best_val_prediction_loss": float(best_val_row["prediction_loss"]),
+        "best_val_one_step_prediction_loss": float(best_val_row["one_step_prediction_loss"]),
+        "best_val_long_horizon_prediction_loss": float(best_val_row["long_horizon_prediction_loss"]),
         "best_val_q_align_loss": float(best_val_row["q_align_loss"]),
         "best_val_latent_align_loss": float(best_val_row["latent_align_loss"]),
         "best_val_semigroup_loss": float(best_val_row["semigroup_loss"]),
@@ -625,11 +783,24 @@ def fit_model(
         "best_val_h_supervised_loss": float(best_val_row["h_supervised_loss"]),
         "best_val_supervised_total_loss": float(best_val_row["supervised_total_loss"]),
         "best_epoch": int(best_val_row["epoch"]),
-        "last_epoch": int(last_val_row["epoch"]),
+        "stopped_early": bool(stop_reason is not None),
+        "stop_epoch": int(epochs_ran),
+        "stop_reason": stop_reason,
+        "early_stopping_monitor": (early_stopping_monitor if early_stopping_enabled else None),
+        "early_stopping_best_epoch": best_early_stop_epoch,
+        "early_stopping_best_value": best_early_stop_value,
+        "early_stopping_patience": (early_stopping_patience if early_stopping_enabled else None),
+        "early_stopping_min_delta": (early_stopping_min_delta if early_stopping_enabled else None),
+        "early_stopping_min_epochs": (early_stopping_min_epochs if early_stopping_enabled else None),
+        "early_stopping_start_phase": (early_stopping_start_phase if early_stopping_enabled else None),
+        "last_epoch": int(epochs_ran),
+        "last_val_epoch": int(last_val_row["epoch"]),
         "last_val_loss": float(last_val_row["loss"]),
         "last_val_koopman_loss": float(last_val_row["koopman_loss"]),
         "last_val_diag_loss": float(last_val_row["diag_loss"]),
         "last_val_prediction_loss": float(last_val_row["prediction_loss"]),
+        "last_val_one_step_prediction_loss": float(last_val_row["one_step_prediction_loss"]),
+        "last_val_long_horizon_prediction_loss": float(last_val_row["long_horizon_prediction_loss"]),
         "last_val_q_align_loss": float(last_val_row["q_align_loss"]),
         "last_val_semigroup_loss": float(last_val_row["semigroup_loss"]),
         "last_val_rg_loss": float(last_val_row["rg_loss"]),
@@ -645,6 +816,12 @@ def fit_model(
         "best_phase3_val_koopman_loss": (float(best_phase3_row["koopman_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_diag_loss": (float(best_phase3_row["diag_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_prediction_loss": (float(best_phase3_row["prediction_loss"]) if best_phase3_row is not None else None),
+        "best_phase3_val_one_step_prediction_loss": (
+            float(best_phase3_row["one_step_prediction_loss"]) if best_phase3_row is not None else None
+        ),
+        "best_phase3_val_long_horizon_prediction_loss": (
+            float(best_phase3_row["long_horizon_prediction_loss"]) if best_phase3_row is not None else None
+        ),
         "best_phase3_val_q_align_loss": (float(best_phase3_row["q_align_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_semigroup_loss": (float(best_phase3_row["semigroup_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_rg_loss": (float(best_phase3_row["rg_loss"]) if best_phase3_row is not None else None),

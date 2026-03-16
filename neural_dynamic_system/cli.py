@@ -26,6 +26,7 @@ from neural_dynamic_system import (  # noqa: E402
     generate_synthetic_trajectory,
     load_trajectory,
 )
+from neural_dynamic_system.reporting import build_run_visual_payload, save_single_run_plots  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--h_dim", "--m_dim", dest="h_dim", type=int, default=2)
     parser.add_argument("--koopman_dim", type=int, default=None)
     parser.add_argument("--latent_scheme", type=str, default="soft_spectrum", choices=["hard_split", "soft_spectrum"])
+    parser.add_argument("--koopman_input_mode", type=str, default="slow_only", choices=["joint", "slow_only"])
+    parser.add_argument("--hidden_coordinate_mode", type=str, default="normal_residual", choices=["direct", "normal_residual"])
     parser.add_argument("--modal_dim", type=int, default=8)
     parser.add_argument("--modal_temperature", type=float, default=0.35)
     parser.add_argument("--encoder_type", type=str, default="temporal_conv", choices=["temporal_conv", "mlp"])
@@ -56,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         "--curriculum_preset",
         type=str,
         default="legacy",
-        choices=["legacy", "conservative", "alanine_bootstrap"],
+        choices=["legacy", "conservative", "alanine_bootstrap", "vdp_paper", "vdp_structured"],
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -66,6 +69,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=0.05)
     parser.add_argument("--train_fraction", type=float, default=0.8)
     parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--log_every", type=int, default=1)
+    parser.add_argument("--validation_interval", type=int, default=1)
+    parser.add_argument("--schedule_mode", type=str, default=None, choices=["fractional", "metric_driven"])
+    parser.add_argument("--progress_bar", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--early_stopping", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--early_stopping_monitor", type=str, default="prediction_loss", choices=["loss", "prediction_loss"])
+    parser.add_argument("--early_stopping_patience", type=int, default=8)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
+    parser.add_argument("--early_stopping_min_epochs", type=int, default=None)
+    parser.add_argument("--early_stopping_start_phase", type=int, default=3, choices=[0, 1, 2, 3])
+    parser.add_argument("--phase0_min_epochs", type=int, default=None)
+    parser.add_argument("--phase1_min_epochs", type=int, default=None)
+    parser.add_argument("--phase2_min_epochs", type=int, default=None)
+    parser.add_argument("--phase3_min_epochs", type=int, default=None)
+    parser.add_argument("--phase0_reconstruction_improve", type=float, default=None)
+    parser.add_argument("--phase0_koopman_stability_ratio", type=float, default=None)
+    parser.add_argument("--phase0_stable_validations", type=int, default=None)
+    parser.add_argument("--phase1_prediction_improve", type=float, default=None)
+    parser.add_argument("--phase1_q_align_improve", type=float, default=None)
+    parser.add_argument("--phase2_prediction_plateau_tolerance", type=float, default=None)
+    parser.add_argument("--phase2_prediction_plateau_checks", type=int, default=None)
+    parser.add_argument("--phase2_separation_target", type=float, default=None)
+    parser.add_argument("--rollback_prediction_worsen_ratio", type=float, default=None)
+    parser.add_argument("--rollback_long_horizon_worsen_ratio", type=float, default=None)
+    parser.add_argument("--rollback_window", type=int, default=None)
+    parser.add_argument("--rollback_weight_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=123)
 
     parser.add_argument(
@@ -83,19 +112,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs_dim", type=int, default=8, help="Synthetic observation dimension when --data_path is omitted.")
     parser.add_argument("--burn_in", type=int, default=256)
     parser.add_argument("--noise_std", type=float, default=0.01)
-    parser.add_argument("--synthetic_kind", type=str, default="toy", choices=["toy", "no_gap_toy", "alanine_like"])
+    parser.add_argument("--synthetic_kind", type=str, default="toy", choices=["toy", "no_gap_toy", "alanine_like", "van_der_pol"])
     parser.add_argument("--alanine_fast_dim", type=int, default=4)
+    parser.add_argument("--van_der_pol_mu", type=float, default=5.0)
 
-    parser.add_argument("--vamp_weight", type=float, default=0.2)
+    parser.add_argument("--vamp_weight", type=float, default=0.15)
     parser.add_argument("--vamp_align_weight", type=float, default=0.25)
-    parser.add_argument("--koopman_weight", type=float, default=0.25)
-    parser.add_argument("--diag_weight", type=float, default=0.05)
-    parser.add_argument("--latent_align_weight", type=float, default=0.75)
-    parser.add_argument("--semigroup_weight", type=float, default=0.5)
+    parser.add_argument("--koopman_weight", type=float, default=0.2)
+    parser.add_argument("--diag_weight", type=float, default=0.02)
+    parser.add_argument("--latent_align_weight", type=float, default=0.0)
+    parser.add_argument("--semigroup_weight", type=float, default=0.35)
     parser.add_argument("--contract_weight", type=float, default=0.2)
     parser.add_argument("--separation_weight", type=float, default=0.2)
-    parser.add_argument("--rg_weight", type=float, default=0.05)
-    parser.add_argument("--metric_weight", type=float, default=0.1)
+    parser.add_argument("--rg_weight", type=float, default=0.0)
+    parser.add_argument("--metric_weight", type=float, default=0.05)
+    parser.add_argument("--metric_mode", type=str, default="mahalanobis_dynamics", choices=["euclidean", "mahalanobis_dynamics"])
     parser.add_argument("--hidden_l1_weight", "--memory_l1_weight", dest="hidden_l1_weight", type=float, default=1e-4)
     parser.add_argument("--contract_batch", type=int, default=16)
     parser.add_argument("--rg_horizon", type=int, default=1)
@@ -110,6 +141,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--h_supervised_weight", "--m_supervised_weight", dest="h_supervised_weight", type=float, default=0.0)
     parser.add_argument("--label_standardize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval_batch_size", type=int, default=512)
+    parser.add_argument("--trajectory_points", type=int, default=400)
+    parser.add_argument("--report_plots", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--phase1_fraction", type=float, default=None)
     parser.add_argument("--phase2_fraction", type=float, default=None)
     parser.add_argument("--phase3_lr_scale", type=float, default=None)
@@ -135,32 +168,93 @@ def _resolve_curriculum(args: argparse.Namespace) -> dict[str, float | int | str
     presets = {
         "legacy": {
             "epochs": 30,
+            "schedule_mode": "fractional",
             "phase1_fraction": 0.30,
             "phase2_fraction": 0.80,
             "phase3_lr_scale": 0.10,
         },
         "conservative": {
             "epochs": 48,
+            "schedule_mode": "fractional",
             "phase1_fraction": 0.45,
             "phase2_fraction": 0.92,
             "phase3_lr_scale": 0.20,
         },
         "alanine_bootstrap": {
             "epochs": 60,
+            "schedule_mode": "fractional",
             "phase1_fraction": 0.55,
             "phase2_fraction": 0.95,
             "phase3_lr_scale": 0.25,
+        },
+        "vdp_paper": {
+            "epochs": 100,
+            "schedule_mode": "fractional",
+            "phase1_fraction": 0.15,
+            "phase2_fraction": 0.65,
+            "phase3_lr_scale": 0.20,
+        },
+        "vdp_structured": {
+            "epochs": 72,
+            "schedule_mode": "metric_driven",
+            "phase1_fraction": 0.30,
+            "phase2_fraction": 0.80,
+            "phase3_lr_scale": 0.35,
+            "phase0_min_epochs": 8,
+            "phase1_min_epochs": 12,
+            "phase2_min_epochs": 16,
+            "phase3_min_epochs": 8,
+            "phase0_reconstruction_improve": 0.20,
+            "phase0_koopman_stability_ratio": 1.20,
+            "phase0_stable_validations": 2,
+            "phase1_prediction_improve": 0.20,
+            "phase1_q_align_improve": 0.20,
+            "phase2_prediction_plateau_tolerance": 0.02,
+            "phase2_prediction_plateau_checks": 2,
+            "phase2_separation_target": 0.08,
+            "rollback_prediction_worsen_ratio": 0.25,
+            "rollback_long_horizon_worsen_ratio": 0.35,
+            "rollback_window": 2,
+            "rollback_weight_scale": 0.50,
         },
     }
     resolved = dict(presets[str(args.curriculum_preset)])
     if args.epochs is not None:
         resolved["epochs"] = int(args.epochs)
+    if args.schedule_mode is not None:
+        resolved["schedule_mode"] = str(args.schedule_mode)
     if args.phase1_fraction is not None:
         resolved["phase1_fraction"] = float(args.phase1_fraction)
     if args.phase2_fraction is not None:
         resolved["phase2_fraction"] = float(args.phase2_fraction)
     if args.phase3_lr_scale is not None:
         resolved["phase3_lr_scale"] = float(args.phase3_lr_scale)
+    for key in (
+        "phase0_min_epochs",
+        "phase1_min_epochs",
+        "phase2_min_epochs",
+        "phase3_min_epochs",
+        "phase0_stable_validations",
+        "phase2_prediction_plateau_checks",
+        "rollback_window",
+    ):
+        value = getattr(args, key)
+        if value is not None:
+            resolved[key] = int(value)
+    for key in (
+        "phase0_reconstruction_improve",
+        "phase0_koopman_stability_ratio",
+        "phase1_prediction_improve",
+        "phase1_q_align_improve",
+        "phase2_prediction_plateau_tolerance",
+        "phase2_separation_target",
+        "rollback_prediction_worsen_ratio",
+        "rollback_long_horizon_worsen_ratio",
+        "rollback_weight_scale",
+    ):
+        value = getattr(args, key)
+        if value is not None:
+            resolved[key] = float(value)
     resolved["curriculum_preset"] = str(args.curriculum_preset)
     return resolved
 
@@ -406,6 +500,8 @@ def main() -> None:
     label_names: list[str] | None = None
     label_stats = None
     supervision_cfg = None
+    analysis_label_episodes = None
+    analysis_label_names: list[str] | None = None
     curriculum_cfg = _resolve_curriculum(args)
     supervision_enabled = any(weight > 0.0 for weight in (args.q_supervised_weight, args.h_supervised_weight))
 
@@ -423,6 +519,7 @@ def main() -> None:
             noise_std=args.noise_std,
             seed=args.seed,
             alanine_fast_dim=args.alanine_fast_dim,
+            van_der_pol_mu=args.van_der_pol_mu,
             num_episodes=args.num_episodes,
         )
         synth = generate_synthetic_trajectory(synth_cfg)
@@ -445,6 +542,13 @@ def main() -> None:
             "synthetic_config": synth_cfg.to_dict(),
             "synthetic_metadata": synth.get("metadata", {}),
         }
+        if synthetic_probe_labels is not None and synthetic_probe_names is not None:
+            analysis_label_episodes = coerce_episode_list(
+                synthetic_probe_labels,
+                name="synthetic_probe_labels",
+                dtype=np.float32,
+            )
+            analysis_label_names = list(synthetic_probe_names)
 
     trajectory_episodes = coerce_episode_list(trajectory, name="trajectory", dtype=float)
     input_dim = _episode_feature_dim(trajectory_episodes)
@@ -484,47 +588,53 @@ def main() -> None:
     if args.label_path:
         label_path = ROOT / args.label_path if not Path(args.label_path).is_absolute() else Path(args.label_path)
         label_array, label_names = _load_array_with_names(label_path, array_key=args.label_array_key)
+        analysis_label_episodes = coerce_episode_list(label_array, name="analysis_labels", dtype=np.float32)
+        analysis_label_names = list(label_names)
     elif supervision_enabled and synthetic_supervision_labels is not None and synthetic_supervision_names is not None:
         label_array = np.asarray(synthetic_supervision_labels, dtype=np.float32)
         label_names = list(synthetic_supervision_names)
 
     label_episodes = None
     if label_array is not None:
-        label_episodes = coerce_episode_list(label_array, name="labels", dtype=np.float32)
-        if len(label_episodes) != len(trajectory_episodes):
+        raw_label_episodes = coerce_episode_list(label_array, name="labels", dtype=np.float32)
+        if len(raw_label_episodes) != len(trajectory_episodes):
             raise ValueError("label array must contain the same number of episodes as trajectory")
-        for idx, (trajectory_episode, label_episode) in enumerate(zip(trajectory_episodes, label_episodes)):
+        for idx, (trajectory_episode, label_episode) in enumerate(zip(trajectory_episodes, raw_label_episodes)):
             if len(label_episode) != len(trajectory_episode):
                 raise ValueError(f"labels[{idx}] must have the same length as trajectory[{idx}]")
+        if analysis_label_episodes is None:
+            analysis_label_episodes = raw_label_episodes
+            analysis_label_names = list(label_names) if label_names is not None else None
 
-        total_label_dim = _episode_feature_dim(label_episodes)
-        q_indices = _infer_indices(args.q_label_indices, start=0, block_dim=args.q_dim, total_dim=total_label_dim)
-        h_indices = _infer_indices(
-            args.h_label_indices,
-            start=len(q_indices),
-            block_dim=args.h_dim,
-            total_dim=total_label_dim,
-        )
-        splits = compute_episode_splits(
-            trajectory_lengths,
-            context_len=args.window,
-            horizons=tuple(args.horizons),
-            train_fraction=args.train_fraction,
-        )
-        skip_indices = q_indices if (args.q_supervision_mode == "angular" and args.q_supervised_weight > 0.0) else ()
-        label_episodes, label_stats = _standardize_labels(
-            label_episodes,
-            splits=splits,
-            enabled=bool(args.label_standardize),
-            skip_indices=skip_indices,
-        )
-        supervision_cfg = SupervisionConfig(
-            q_indices=q_indices,
-            h_indices=h_indices,
-            q_weight=args.q_supervised_weight,
-            h_weight=args.h_supervised_weight,
-            q_mode=args.q_supervision_mode,
-        )
+        if supervision_enabled:
+            total_label_dim = _episode_feature_dim(raw_label_episodes)
+            q_indices = _infer_indices(args.q_label_indices, start=0, block_dim=args.q_dim, total_dim=total_label_dim)
+            h_indices = _infer_indices(
+                args.h_label_indices,
+                start=len(q_indices),
+                block_dim=args.h_dim,
+                total_dim=total_label_dim,
+            )
+            splits = compute_episode_splits(
+                trajectory_lengths,
+                context_len=args.window,
+                horizons=tuple(args.horizons),
+                train_fraction=args.train_fraction,
+            )
+            skip_indices = q_indices if (args.q_supervision_mode == "angular" and args.q_supervised_weight > 0.0) else ()
+            label_episodes, label_stats = _standardize_labels(
+                raw_label_episodes,
+                splits=splits,
+                enabled=bool(args.label_standardize),
+                skip_indices=skip_indices,
+            )
+            supervision_cfg = SupervisionConfig(
+                q_indices=q_indices,
+                h_indices=h_indices,
+                q_weight=args.q_supervised_weight,
+                h_weight=args.h_supervised_weight,
+                q_mode=args.q_supervision_mode,
+            )
 
     model_cfg = ModelConfig(
         input_dim=input_dim,
@@ -533,6 +643,8 @@ def main() -> None:
         h_dim=args.h_dim,
         koopman_dim=args.koopman_dim,
         latent_scheme=args.latent_scheme,
+        koopman_input_mode=args.koopman_input_mode,
+        hidden_coordinate_mode=args.hidden_coordinate_mode,
         modal_dim=args.modal_dim,
         modal_temperature=args.modal_temperature,
         encoder_type=args.encoder_type,
@@ -559,9 +671,35 @@ def main() -> None:
         device=args.device,
         rg_horizon=args.rg_horizon,
         contract_batch=args.contract_batch,
+        schedule_mode=str(curriculum_cfg.get("schedule_mode", "fractional")),
         phase1_fraction=float(curriculum_cfg["phase1_fraction"]),
         phase2_fraction=float(curriculum_cfg["phase2_fraction"]),
         phase3_lr_scale=float(curriculum_cfg["phase3_lr_scale"]),
+        phase0_min_epochs=int(curriculum_cfg.get("phase0_min_epochs", 6)),
+        phase1_min_epochs=int(curriculum_cfg.get("phase1_min_epochs", 10)),
+        phase2_min_epochs=int(curriculum_cfg.get("phase2_min_epochs", 12)),
+        phase3_min_epochs=int(curriculum_cfg.get("phase3_min_epochs", 6)),
+        phase0_reconstruction_improve=float(curriculum_cfg.get("phase0_reconstruction_improve", 0.20)),
+        phase0_koopman_stability_ratio=float(curriculum_cfg.get("phase0_koopman_stability_ratio", 1.25)),
+        phase0_stable_validations=int(curriculum_cfg.get("phase0_stable_validations", 2)),
+        phase1_prediction_improve=float(curriculum_cfg.get("phase1_prediction_improve", 0.20)),
+        phase1_q_align_improve=float(curriculum_cfg.get("phase1_q_align_improve", 0.20)),
+        phase2_prediction_plateau_tolerance=float(curriculum_cfg.get("phase2_prediction_plateau_tolerance", 0.02)),
+        phase2_prediction_plateau_checks=int(curriculum_cfg.get("phase2_prediction_plateau_checks", 2)),
+        phase2_separation_target=float(curriculum_cfg.get("phase2_separation_target", 0.08)),
+        rollback_prediction_worsen_ratio=float(curriculum_cfg.get("rollback_prediction_worsen_ratio", 0.25)),
+        rollback_long_horizon_worsen_ratio=float(curriculum_cfg.get("rollback_long_horizon_worsen_ratio", 0.35)),
+        rollback_window=int(curriculum_cfg.get("rollback_window", 2)),
+        rollback_weight_scale=float(curriculum_cfg.get("rollback_weight_scale", 0.5)),
+        log_every=args.log_every,
+        validation_interval=args.validation_interval,
+        progress_bar=bool(args.progress_bar),
+        early_stopping=bool(args.early_stopping),
+        early_stopping_monitor=args.early_stopping_monitor,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
+        early_stopping_min_epochs=args.early_stopping_min_epochs,
+        early_stopping_start_phase=args.early_stopping_start_phase,
         seed=args.seed,
     )
     loss_cfg = LossConfig(
@@ -575,6 +713,7 @@ def main() -> None:
         separation_weight=args.separation_weight,
         rg_weight=args.rg_weight,
         metric_weight=args.metric_weight,
+        metric_mode=args.metric_mode,
         hidden_l1_weight=args.hidden_l1_weight,
     )
 
@@ -583,7 +722,7 @@ def main() -> None:
         model_cfg=model_cfg,
         train_cfg=train_cfg,
         loss_cfg=loss_cfg,
-        labels=label_episodes,
+        labels=(label_episodes if supervision_enabled else None),
         supervision_cfg=supervision_cfg,
     )
 
@@ -615,15 +754,23 @@ def main() -> None:
         "supervision_config": (supervision_cfg.to_dict() if supervision_cfg is not None else None),
         "label_stats": label_stats,
         "label_names": label_names,
+        "analysis_label_names": analysis_label_names,
+        "report_plots": bool(args.report_plots),
+        "trajectory_points": int(args.trajectory_points),
         **source_summary,
     }
     (out_dir / "config.json").write_text(json.dumps(config_payload, indent=2), encoding="utf-8")
     (out_dir / "summary.json").write_text(json.dumps(result.summary, indent=2), encoding="utf-8")
+    if result.summary.get("schedule_events"):
+        (out_dir / "phase_events.json").write_text(
+            json.dumps(result.summary["schedule_events"], indent=2),
+            encoding="utf-8",
+        )
 
     probe_summary = None
     if args.label_path:
-        probe_source_labels = label_episodes
-        probe_source_names = label_names
+        probe_source_labels = analysis_label_episodes
+        probe_source_names = analysis_label_names
     elif synthetic_probe_labels is not None and synthetic_probe_names is not None:
         probe_source_labels = coerce_episode_list(
             synthetic_probe_labels,
@@ -632,8 +779,8 @@ def main() -> None:
         )
         probe_source_names = list(synthetic_probe_names)
     else:
-        probe_source_labels = label_episodes
-        probe_source_names = label_names
+        probe_source_labels = analysis_label_episodes
+        probe_source_names = analysis_label_names
     if probe_source_labels is not None and probe_source_names is not None:
         probe_summary, corr_df = _label_probe(
             trajectory=trajectory_episodes,
@@ -644,10 +791,35 @@ def main() -> None:
             train_cfg=train_cfg,
             eval_batch_size=args.eval_batch_size,
         )
-        probe_json_name = "label_probe.json" if label_episodes is not None else "synthetic_hidden_probe.json"
-        corr_csv_name = "label_component_corrs.csv" if label_episodes is not None else "synthetic_component_corrs.csv"
-        (out_dir / probe_json_name).write_text(json.dumps(probe_summary, indent=2), encoding="utf-8")
-        corr_df.to_csv(out_dir / corr_csv_name, index=False)
+        (out_dir / "analysis_labels_probe.json").write_text(json.dumps(probe_summary, indent=2), encoding="utf-8")
+        corr_df.to_csv(out_dir / "analysis_component_corrs.csv", index=False)
+        if label_episodes is not None:
+            (out_dir / "label_probe.json").write_text(json.dumps(probe_summary, indent=2), encoding="utf-8")
+            corr_df.to_csv(out_dir / "label_component_corrs.csv", index=False)
+        elif synthetic_probe_labels is not None:
+            (out_dir / "synthetic_hidden_probe.json").write_text(json.dumps(probe_summary, indent=2), encoding="utf-8")
+            corr_df.to_csv(out_dir / "synthetic_component_corrs.csv", index=False)
+
+    if bool(args.report_plots) and probe_source_labels is not None and probe_source_names is not None and len(probe_source_names) >= 2:
+        visual_payload = build_run_visual_payload(
+            run_name=out_dir.name,
+            title=out_dir.name.replace("_", " "),
+            color="#b5542b",
+            trajectory=trajectory_episodes,
+            analysis_labels=probe_source_labels,
+            result=result,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            history=result.history,
+            summary=result.summary,
+            eval_batch_size=args.eval_batch_size,
+        )
+        visual_payload.horizon_metrics.to_csv(out_dir / "horizon_metrics.csv", index=False)
+        save_single_run_plots(
+            visual_payload,
+            out_dir,
+            trajectory_points=args.trajectory_points,
+        )
 
     print("\n=== neural dynamical system training finished ===")
     print(f"device: {result.summary['device']}")
@@ -671,6 +843,13 @@ def main() -> None:
     print(f"last val rg loss: {result.summary['last_val_rg_loss']:.6f}")
     print(f"last val Koopman loss: {result.summary['last_val_koopman_loss']:.6f}")
     print(f"last val diagonalization loss: {result.summary['last_val_diag_loss']:.6f}")
+    if result.summary.get("stopped_early"):
+        print(
+            "early stopping: "
+            f"epoch={int(result.summary['stop_epoch'])} "
+            f"monitor={result.summary['early_stopping_monitor']} "
+            f"reason={result.summary['stop_reason']}"
+        )
     if result.summary["best_phase3_epoch"] is not None:
         print(f"best phase-3 epoch: {result.summary['best_phase3_epoch']}")
         print(f"best phase-3 val Koopman loss: {result.summary['best_phase3_val_koopman_loss']:.6f}")

@@ -28,14 +28,17 @@ class SyntheticTrajectoryConfig:
     noise_std: float = 0.01
     seed: int = 123
     alanine_fast_dim: int = 4
+    van_der_pol_mu: float = 5.0
     num_episodes: int = 1
 
     def __post_init__(self) -> None:
         self.kind = str(self.kind).lower()
-        if self.kind not in {"toy", "no_gap_toy", "alanine_like"}:
-            raise ValueError("kind must be one of: toy, no_gap_toy, alanine_like")
+        if self.kind not in {"toy", "no_gap_toy", "alanine_like", "van_der_pol"}:
+            raise ValueError("kind must be one of: toy, no_gap_toy, alanine_like, van_der_pol")
         if int(self.alanine_fast_dim) < 2:
             raise ValueError("alanine_fast_dim must be >= 2")
+        if float(self.van_der_pol_mu) <= 0.0:
+            raise ValueError("van_der_pol_mu must be > 0")
         if int(self.num_episodes) < 1:
             raise ValueError("num_episodes must be >= 1")
 
@@ -103,6 +106,13 @@ def _build_toy_features(hidden: np.ndarray) -> np.ndarray:
     )
 
 
+def _van_der_pol_rhs(state: np.ndarray, *, mu: float) -> np.ndarray:
+    x, v = state
+    dx = v
+    dv = float(mu) * (1.0 - x * x) * v - x
+    return np.array([dx, dv], dtype=float)
+
+
 def _generate_toy_episode(
     cfg: SyntheticTrajectoryConfig,
     *,
@@ -141,6 +151,66 @@ def _generate_toy_episode(
         "metadata": {
             "kind": ("no_gap_toy" if no_gap else "toy"),
             "label_names": label_names,
+            "seed": int(cfg.seed),
+        },
+    }
+
+
+def _generate_van_der_pol_episode(
+    cfg: SyntheticTrajectoryConfig,
+) -> dict[str, np.ndarray | list[str] | dict[str, object]]:
+    rng = np.random.default_rng(int(cfg.seed))
+    total_steps = int(cfg.steps) + int(cfg.burn_in)
+    hidden = np.zeros((total_steps, 2), dtype=float)
+    hidden[0] = np.array([1.8, 0.0], dtype=float) + rng.normal(scale=np.array([0.35, 0.25], dtype=float), size=2)
+    rhs = lambda state: _van_der_pol_rhs(state, mu=float(cfg.van_der_pol_mu))
+    system_noise = np.array([0.004, 0.006], dtype=float)
+    for idx in range(1, total_steps):
+        next_state = _rk4_step(hidden[idx - 1], dt=float(cfg.dt), rhs=rhs)
+        next_state += rng.normal(scale=system_noise, size=2)
+        hidden[idx] = next_state
+
+    hidden = hidden[int(cfg.burn_in) :]
+    x = hidden[:, 0]
+    v = hidden[:, 1]
+    feature_stack = np.column_stack(
+        [
+            x,
+            v,
+            x * v,
+            x**2,
+            v**2,
+            np.sin(x),
+            np.cos(x),
+            np.tanh(v),
+            x**3,
+            v * np.sin(x),
+        ]
+    )
+    trajectory = _mix_observations(
+        feature_stack,
+        obs_dim=int(cfg.obs_dim),
+        noise_std=float(cfg.noise_std),
+        rng=rng,
+    )
+    amplitude = np.sqrt(np.maximum(x * x + v * v, 1e-8))
+    phase = np.arctan2(v, x)
+    labels = np.column_stack([x, v]).astype(np.float32)
+    label_names = ["x", "v"]
+    probe_labels = np.column_stack([x, v, phase, amplitude]).astype(np.float32)
+    probe_label_names = ["x", "v", "phase", "amplitude"]
+    return {
+        "trajectory": trajectory,
+        "hidden_state": hidden.astype(np.float32),
+        "labels": labels,
+        "label_names": label_names,
+        "probe_labels": probe_labels,
+        "probe_label_names": probe_label_names,
+        "metadata": {
+            "kind": "van_der_pol",
+            "label_names": label_names,
+            "probe_label_names": probe_label_names,
+            "mu": float(cfg.van_der_pol_mu),
             "seed": int(cfg.seed),
         },
     }
@@ -298,6 +368,8 @@ def _generate_single_synthetic_trajectory(
         return _generate_toy_episode(cfg, no_gap=False)
     if cfg.kind == "no_gap_toy":
         return _generate_toy_episode(cfg, no_gap=True)
+    if cfg.kind == "van_der_pol":
+        return _generate_van_der_pol_episode(cfg)
     return _generate_alanine_like_episode(cfg)
 
 
