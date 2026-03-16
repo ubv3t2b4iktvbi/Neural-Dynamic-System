@@ -1,0 +1,7 @@
+interface:
+  display_name: "Neural Dynamics Training Runner"
+  short_description: "Run training jobs and collect Neural Dynamic System artifacts"
+  default_prompt: "Use $neural-dynamics-training-runner to launch or rerun a Neural Dynamic System experiment and summarize the saved artifacts."
+
+policy:
+  allow_implicit_invocation: true

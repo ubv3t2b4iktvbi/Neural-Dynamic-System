@@ -1,0 +1,7 @@
+interface:
+  display_name: "Dynamical Theory Reasoner"
+  short_description: "Interpret ablations with theory-aware coordinate diagnostics"
+  default_prompt: "Use $dynamical-theory-reasoner to interpret coordinate experiments and propose the next dynamical-systems validation step."
+
+policy:
+  allow_implicit_invocation: true

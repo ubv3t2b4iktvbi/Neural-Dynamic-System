@@ -1,0 +1,7 @@
+interface:
+  display_name: "Factor Review Archivist"
+  short_description: "Package mining outputs for human review"
+  default_prompt: "Use $factor-review-archivist to archive a factor-mining run into complete review-ready artifacts."
+
+policy:
+  allow_implicit_invocation: true

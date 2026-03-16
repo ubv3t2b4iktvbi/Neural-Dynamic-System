@@ -1,0 +1,7 @@
+interface:
+  display_name: "Thread Skill Maintainer"
+  short_description: "Turn recurring thread feedback into maintainable project skills"
+  default_prompt: "Use $thread-skill-maintainer to summarize recent thread guidance, decide whether to update, merge, or draft a skill, and validate compatibility across the local skill trees."
+
+policy:
+  allow_implicit_invocation: true

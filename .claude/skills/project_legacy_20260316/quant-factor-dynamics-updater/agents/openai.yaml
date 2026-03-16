@@ -1,0 +1,7 @@
+interface:
+  display_name: "Quant Factor Dynamics Updater"
+  short_description: "Translate external quant alpha motifs into dynamical factors"
+  default_prompt: "Use $quant-factor-dynamics-updater to inspect an external quant factor repo, extract its dynamical essence, update the local dynamical factor library, and design validation experiments."
+
+policy:
+  allow_implicit_invocation: true

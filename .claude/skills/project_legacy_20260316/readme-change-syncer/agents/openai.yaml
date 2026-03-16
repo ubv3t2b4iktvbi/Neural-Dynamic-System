@@ -1,0 +1,7 @@
+interface:
+  display_name: "README Change Syncer"
+  short_description: "Update folder READMEs from code changes"
+  default_prompt: "Use $readme-change-syncer to update DynamicAlpha Lab subfolder READMEs and the root README so they match the current code changes."
+
+policy:
+  allow_implicit_invocation: true

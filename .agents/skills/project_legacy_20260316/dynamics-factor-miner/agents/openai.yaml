@@ -1,0 +1,7 @@
+interface:
+  display_name: "Dynamics Factor Miner"
+  short_description: "Design and screen causal dynamical factors"
+  default_prompt: "Use $dynamics-factor-miner to turn qualitative signal ideas into causal factor specs and a smoke-tested screening plan."
+
+policy:
+  allow_implicit_invocation: true

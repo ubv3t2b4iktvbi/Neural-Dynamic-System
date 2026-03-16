@@ -1,0 +1,7 @@
+interface:
+  display_name: "Stage Capability Gap Closer"
+  short_description: "Warm-start stage-by-stage gap closure for Neural Dynamic System"
+  default_prompt: "Use $stage-capability-gap-closer to iteratively close the gap between each stage goal and current model capability while reusing the current checkpoint whenever possible."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Closed Loop Factor Orchestrator"
+  short_description: "Run the full research loop from ablation to factor mining"
+  default_prompt: "Use $closed-loop-factor-orchestrator to run the full ablation-plus-coordinate-plus-factor loop and summarize the next experiment."
+
+policy:
+  allow_implicit_invocation: true

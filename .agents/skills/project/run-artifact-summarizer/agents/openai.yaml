@@ -1,0 +1,7 @@
+interface:
+  display_name: "Run Artifact Summarizer"
+  short_description: "Summarize and compare Neural Dynamic System run outputs"
+  default_prompt: "Use $run-artifact-summarizer to read a Neural Dynamic System run directory and explain the key metrics, probes, and next steps."
+
+policy:
+  allow_implicit_invocation: true

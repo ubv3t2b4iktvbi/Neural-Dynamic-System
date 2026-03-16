@@ -1,0 +1,7 @@
+interface:
+  display_name: "Math Implementation Validator"
+  short_description: "Translate code into formulas and verify the math"
+  default_prompt: "Use $math-implementation-validator to inspect math-heavy code, restate it as formulas, audit operators like gradients or Jacobians, and design or implement targeted validation tests."
+
+policy:
+  allow_implicit_invocation: true

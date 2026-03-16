@@ -1,0 +1,7 @@
+interface:
+  display_name: "Vibe Coding"
+  short_description: "Repo-aware maintenance for DynamicAlpha Lab"
+  default_prompt: "Use $vibe-coding to maintain or extend DynamicAlpha Lab with repo-aware file placement, registry wiring, and small-scope validation."
+
+policy:
+  allow_implicit_invocation: true

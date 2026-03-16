@@ -270,7 +270,7 @@ def train_run(spec: RunSpec, args: argparse.Namespace, out_root: Path) -> None:
     print(f"\n[train] {spec.title}")
     subprocess.run(cmd, check=True, cwd=str(ROOT))
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-    best_rmse = math.sqrt(max(float(summary["best_val_prediction_loss"]), 0.0))
+    best_rmse = math.sqrt(max(float(summary["best_val_one_step_prediction_loss"]), 0.0))
     print(
         f"[done] {spec.title}: best_epoch={summary['best_epoch']} "
         f"best_val_rmse={best_rmse:.4f} phase={summary['best_val_phase']}"

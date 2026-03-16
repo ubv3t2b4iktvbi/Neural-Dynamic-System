@@ -1,0 +1,7 @@
+interface:
+  display_name: "Neural Dynamics Vibe Coding"
+  short_description: "Repo-aware maintenance for Neural Dynamic System"
+  default_prompt: "Use $neural-dynamics-vibe-coding to make a repo-aware change in Neural Dynamic System and verify it with the smallest relevant check."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Dynamics Literature Factor Updater"
+  short_description: "Mine factors from dynamics literature and models"
+  default_prompt: "Use $dynamics-literature-factor-updater to search primary dynamics literature or canonical models, extract reusable mechanistic motifs, translate them into causal factors, and expand the local factor library with validation plans."
+
+policy:
+  allow_implicit_invocation: true

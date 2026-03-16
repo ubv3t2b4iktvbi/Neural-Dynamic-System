@@ -414,7 +414,7 @@ def save_comparison_artifacts(
                 "best_epoch": int(payload.summary["best_epoch"]),
                 "stop_epoch": int(payload.summary["stop_epoch"]),
                 "stopped_early": bool(payload.summary.get("stopped_early", False)),
-                "best_val_rmse": math.sqrt(max(float(payload.summary["best_val_prediction_loss"]), 0.0)),
+                "best_val_rmse": math.sqrt(max(float(payload.summary["best_val_one_step_prediction_loss"]), 0.0)),
                 "best_val_one_step_rmse": math.sqrt(max(float(payload.summary["best_val_one_step_prediction_loss"]), 0.0)),
                 "best_val_long_horizon_rmse": math.sqrt(
                     max(float(payload.summary["best_val_long_horizon_prediction_loss"]), 0.0)

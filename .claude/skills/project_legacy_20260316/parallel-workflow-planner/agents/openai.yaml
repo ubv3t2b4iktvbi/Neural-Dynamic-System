@@ -1,0 +1,7 @@
+interface:
+  display_name: "Parallel Workflow Planner"
+  short_description: "Plan human-gated parallel work before execution"
+  default_prompt: "Use $parallel-workflow-planner to clarify requirements, map the dependency tree, isolate conflict zones, and stage safe parallel batches before execution."
+
+policy:
+  allow_implicit_invocation: true

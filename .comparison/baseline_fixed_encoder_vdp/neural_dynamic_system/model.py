@@ -64,34 +64,6 @@ class _TemporalResBlock(nn.Module):
         return self.skip(x) + h
 
 
-class _ConvexPermutationMixer(nn.Module):
-    """mHC-lite style mixer: convex combination of permutation matrices."""
-
-    def __init__(self, dim: int, *, atoms: int):
-        super().__init__()
-        self.dim = int(dim)
-        self.atoms = max(1, int(atoms))
-        eye = torch.eye(self.dim)
-        perms = []
-        stride = max(self.dim // self.atoms, 1)
-        for idx in range(self.atoms):
-            shift = (idx * stride) % max(self.dim, 1)
-            perms.append(torch.roll(eye, shifts=shift, dims=1))
-        self.register_buffer("perm_bank", torch.stack(perms, dim=0))
-        self.logits = nn.Parameter(torch.zeros(self.atoms))
-
-    def weights(self, ref: Tensor) -> Tensor:
-        return torch.softmax(self.logits, dim=0).to(device=ref.device, dtype=ref.dtype)
-
-    def matrix(self, ref: Tensor) -> Tensor:
-        bank = self.perm_bank.to(device=ref.device, dtype=ref.dtype)
-        return torch.einsum("k,kij->ij", self.weights(ref), bank)
-
-    def forward(self, x: Tensor) -> Tensor:
-        mix = self.matrix(x)
-        return x @ mix.transpose(0, 1)
-
-
 class RunningWhitenedVAMP(nn.Module):
     def __init__(self, dim: int, *, momentum: float, eps: float):
         super().__init__()
@@ -191,8 +163,6 @@ class LatentRGManifoldAutoencoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.latent_scheme = str(cfg.latent_scheme).lower()
-        self.koopman_input_mode = str(cfg.koopman_input_mode).lower()
-        self.hidden_coordinate_mode = str(cfg.hidden_coordinate_mode).lower()
         self.koopman_dim = int(cfg.koopman_dim)
         self.hidden_rank = min(int(cfg.hidden_rank), int(cfg.h_dim))
         flat_dim = int(cfg.input_dim) * int(cfg.context_len)
@@ -209,7 +179,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
         else:
             raise ValueError(f"Unknown encoder_type={cfg.encoder_type!r}")
 
-        if self.koopman_input_mode == "joint" and self.latent_scheme == "soft_spectrum":
+        if self.latent_scheme == "soft_spectrum":
             koopman_input_dim = int(q_hidden_dim + fast_hidden_dim)
         else:
             koopman_input_dim = int(q_hidden_dim)
@@ -223,10 +193,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
             momentum=cfg.vamp_whitening_momentum,
             eps=cfg.vamp_whitening_eps,
         )
-        if self.hidden_coordinate_mode == "normal_residual":
-            h_input_dim = int(fast_hidden_dim + cfg.h_dim)
-        else:
-            h_input_dim = int(fast_hidden_dim + self.koopman_dim)
+        h_input_dim = int(fast_hidden_dim + self.koopman_dim)
         self.h_head = nn.Sequential(
             nn.LayerNorm(h_input_dim),
             _mlp(h_input_dim, cfg.h_dim, cfg.hidden_dim, 1),
@@ -256,9 +223,6 @@ class LatentRGManifoldAutoencoder(nn.Module):
             ]
         )
         self.h_drive_net = _mlp(cfg.q_dim, cfg.h_dim, cfg.hidden_dim, cfg.depth)
-        mixer_atoms = max(1, int(getattr(cfg, "memory_mixer_atoms", min(4, int(cfg.h_dim)))))
-        self.memory_mixer = _ConvexPermutationMixer(int(cfg.h_dim), atoms=mixer_atoms)
-        self.memory_head_logits = nn.Parameter(torch.zeros(int(cfg.h_dim)))
 
         self.manifold_decoder = _mlp(cfg.q_dim, cfg.input_dim, cfg.hidden_dim, cfg.depth)
         self.hidden_readout_net = _mlp(cfg.q_dim, cfg.input_dim * cfg.h_dim, cfg.hidden_dim, cfg.depth)
@@ -300,95 +264,15 @@ class LatentRGManifoldAutoencoder(nn.Module):
         fast_weights = torch.softmax(centered, dim=-1)
         return slow_weights, fast_weights
 
-    def memory_head_gates(self, ref: Tensor) -> Tensor:
-        return torch.sigmoid(self.memory_head_logits).to(device=ref.device, dtype=ref.dtype)
-
-    def mixed_memory(self, h: Tensor) -> Tensor:
-        gated = h * self.memory_head_gates(h).unsqueeze(0)
-        return self.memory_mixer(gated)
-
-    def _geometry_eps(self) -> float:
-        return max(float(self.cfg.vamp_whitening_eps), float(self.cfg.rg_eps), 1e-6)
-
-    def _solve_projected_coeffs(self, basis: Tensor, rhs: Tensor) -> Tensor:
-        gram = torch.bmm(basis.transpose(1, 2), basis)
-        eye = torch.eye(gram.shape[-1], device=gram.device, dtype=gram.dtype).unsqueeze(0)
-        gram = gram + self._geometry_eps() * eye
-        proj = torch.bmm(basis.transpose(1, 2), rhs)
-        return torch.linalg.solve(gram, proj)
-
-    def _decoder_geometry(
-        self,
-        q: Tensor,
-        *,
-        create_graph: bool | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        if create_graph is None:
-            create_graph = bool(torch.is_grad_enabled() and q.requires_grad)
-        q_input = q if create_graph else q.detach().requires_grad_(True)
-        with torch.enable_grad():
-            q_input = q_input.requires_grad_(True)
-            base = self.manifold_decoder(q_input)
-            tangent_columns: list[Tensor] = []
-            for obs_idx in range(int(self.cfg.input_dim)):
-                grad = torch.autograd.grad(
-                    base[:, obs_idx].sum(),
-                    q_input,
-                    retain_graph=True,
-                    create_graph=create_graph,
-                )[0]
-                tangent_columns.append(grad)
-            tangent = torch.stack(tangent_columns, dim=1)
-            raw_basis = self.hidden_readout_net(q_input).view(q_input.shape[0], self.cfg.input_dim, self.cfg.h_dim)
-            tangent_coeffs = self._solve_projected_coeffs(tangent, raw_basis)
-            normal_basis = raw_basis - torch.bmm(tangent, tangent_coeffs)
-        if not create_graph:
-            return base.detach(), tangent.detach(), normal_basis.detach()
-        return base, tangent, normal_basis
-
-    def _hidden_coordinates(
-        self,
-        q: Tensor,
-        current: Tensor,
-        fast_hidden: Tensor,
-    ) -> dict[str, Tensor]:
-        base, tangent, normal_basis = self._decoder_geometry(q)
-        residual = current - base
-        tangent_component = torch.bmm(
-            tangent,
-            self._solve_projected_coeffs(tangent, residual.unsqueeze(-1)),
-        ).squeeze(-1)
-        normal_residual = residual - tangent_component
-        geometric_h = self._solve_projected_coeffs(normal_basis, normal_residual.unsqueeze(-1)).squeeze(-1)
-        h_refine = 0.1 * torch.tanh(self.h_head(torch.cat([fast_hidden, geometric_h], dim=-1)))
-        h = geometric_h + h_refine
-        return {
-            "base": base,
-            "tangent": tangent,
-            "normal_basis": normal_basis,
-            "residual": residual,
-            "tangent_residual": tangent_component,
-            "normal_residual": normal_residual,
-            "geometric_h": geometric_h,
-            "h": h,
-        }
-
     def spectrum_summary(self) -> dict[str, float | list[float] | str]:
         base_summary: dict[str, float | list[float] | str] = {
-            "latent_structure": (
-                "koopman_q_plus_normal_fiber_hidden_ssm"
-                if self.hidden_coordinate_mode == "normal_residual"
-                else "koopman_q_plus_affine_hidden_ssm"
-            ),
+            "latent_structure": "koopman_q_plus_affine_hidden_ssm",
             "latent_scheme": self.latent_scheme,
             "integrator": "midpoint_q_plus_exact_affine_h",
             "koopman_dim": int(self.koopman_dim),
             "hidden_rank": int(self.hidden_rank),
             "rg_transform": "q_rate_normalized_plus_hidden_sym_damping",
-            "hidden_operator_structure": "strictly_dissipative_diagonal_memory_bank",
-            "memory_mixer": "mhc_lite_convex_permutations",
-            "koopman_input_mode": self.koopman_input_mode,
-            "hidden_coordinate_mode": self.hidden_coordinate_mode,
+            "hidden_operator_structure": "diagonal_plus_low_rank",
         }
         with torch.no_grad():
             rates = self.koopman_rates().detach().cpu()
@@ -411,7 +295,6 @@ class LatentRGManifoldAutoencoder(nn.Module):
                     "modal_slow_entropy": slow_entropy,
                     "modal_fast_entropy": fast_entropy,
                     "modal_memory_entropy": fast_entropy,
-                    "memory_head_gates": self.memory_head_gates(rates).cpu().tolist() if rates.ndim == 1 else [],
                 }
             )
             return base_summary
@@ -419,12 +302,8 @@ class LatentRGManifoldAutoencoder(nn.Module):
     def encode_components(self, window: Tensor, *, update_whitener: bool = True) -> dict[str, Tensor]:
         batch = window.shape[0]
         q_hidden, fast_hidden = self._encode_backbone(window)
-        current = window[:, -1, :]
         if self.latent_scheme == "soft_spectrum":
-            if self.koopman_input_mode == "joint":
-                koopman_input = torch.cat([q_hidden, fast_hidden], dim=-1)
-            else:
-                koopman_input = q_hidden
+            koopman_input = torch.cat([q_hidden, fast_hidden], dim=-1)
             koopman_raw = self.koopman_head(koopman_input)
             koopman_rates = self.koopman_rates().to(device=koopman_raw.device, dtype=koopman_raw.dtype)
             slow_weights, fast_weights = self.modal_weight_vectors(koopman_rates)
@@ -439,26 +318,12 @@ class LatentRGManifoldAutoencoder(nn.Module):
         koopman, koopman_unwhitened = self.koopman_whitener(koopman_raw, update=update_whitener)
         q = koopman[:, : int(self.cfg.q_dim)]
         q_raw = koopman_unwhitened[:, : int(self.cfg.q_dim)]
-        if self.hidden_coordinate_mode == "normal_residual":
-            geometry = self._hidden_coordinates(q, current, fast_hidden)
-            h = geometry["h"]
+        if self.latent_scheme == "soft_spectrum":
+            fast_koopman = koopman * fast_weights_batch
         else:
-            if self.latent_scheme == "soft_spectrum":
-                fast_koopman = koopman * fast_weights_batch
-            else:
-                fast_koopman = koopman
-            h_input = torch.cat([fast_hidden, fast_koopman], dim=-1)
-            h = self.h_head(h_input)
-            zero_obs = current.new_zeros(current.shape)
-            zero_basis = current.new_zeros((batch, int(self.cfg.input_dim), int(self.cfg.h_dim)))
-            geometry = {
-                "base": self.manifold_decoder(q),
-                "residual": zero_obs,
-                "tangent_residual": zero_obs,
-                "normal_residual": zero_obs,
-                "normal_basis": zero_basis,
-                "geometric_h": h,
-            }
+            fast_koopman = koopman
+        h_input = torch.cat([fast_hidden, fast_koopman], dim=-1)
+        h = self.h_head(h_input)
         z = self.join_latent(q, h)
         koopman_rate_batch = koopman_rates.unsqueeze(0).expand(batch, -1)
         return {
@@ -475,12 +340,6 @@ class LatentRGManifoldAutoencoder(nn.Module):
             "memory_hidden": fast_hidden,
             "q_raw": q_raw,
             "q_vamp": q,
-            "current_base": geometry["base"],
-            "current_residual": geometry["residual"],
-            "tangent_residual": geometry["tangent_residual"],
-            "normal_residual": geometry["normal_residual"],
-            "normal_basis": geometry["normal_basis"],
-            "geometric_h": geometry["geometric_h"],
             "modal": koopman,
             "modal_rates": koopman_rate_batch,
             "modal_slow_weights": slow_weights_batch,
@@ -501,13 +360,9 @@ class LatentRGManifoldAutoencoder(nn.Module):
         return self.encode_components(window)["z"]
 
     def decode_parts(self, q: Tensor, h: Tensor) -> Tensor:
-        if self.hidden_coordinate_mode == "normal_residual":
-            base, _, normal_basis = self._decoder_geometry(q)
-            correction = torch.bmm(normal_basis, h.unsqueeze(-1)).squeeze(-1)
-        else:
-            base = self.manifold_decoder(q)
-            hidden_basis = self.hidden_readout_net(q).view(q.shape[0], self.cfg.input_dim, self.cfg.h_dim)
-            correction = torch.bmm(hidden_basis, h.unsqueeze(-1)).squeeze(-1)
+        base = self.manifold_decoder(q)
+        hidden_basis = self.hidden_readout_net(q).view(q.shape[0], self.cfg.input_dim, self.cfg.h_dim)
+        correction = torch.bmm(hidden_basis, h.unsqueeze(-1)).squeeze(-1)
         return base + correction
 
     def decode(self, z: Tensor) -> Tensor:
@@ -520,25 +375,26 @@ class LatentRGManifoldAutoencoder(nn.Module):
         return coupling, value
 
     def _hidden_operator(self, q: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        # Strictly dissipative Markovian embedding for the memory bank.
         fast_rates = self.cfg.min_fast_rate + F.softplus(self.h_rate_net(q))
-        operator = -torch.diag_embed(fast_rates)
-        low_rank_coeffs = q.new_zeros((q.shape[0], self.hidden_rank))
-        sym_eig_upper = -fast_rates.amin(dim=-1, keepdim=True)
+        low_rank_coeffs = torch.tanh(self.h_low_rank_gate(q))
+        left = self.hidden_factors[0] / math.sqrt(max(self.hidden_rank, 1))
+        right = self.hidden_factors[1] / math.sqrt(max(self.hidden_rank, 1))
+        low_rank_update = torch.einsum("br,ir,jr->bij", low_rank_coeffs, left, right)
+        operator = (self.cfg.hidden_operator_scale * low_rank_update) - torch.diag_embed(fast_rates)
+        sym = 0.5 * (operator + operator.transpose(-1, -2))
+        sym_eig_upper = torch.linalg.eigvalsh(sym).amax(dim=-1, keepdim=True)
         return operator, fast_rates, low_rank_coeffs, sym_eig_upper
 
     def latent_statistics(self, z: Tensor) -> dict[str, Tensor]:
         q, h = self.split_latent(z)
         slow_rates = self.slow_koopman_rates().to(device=q.device, dtype=q.dtype).unsqueeze(0).expand_as(q)
         slow_residual = self.cfg.slow_residual_scale * torch.tanh(self.q_residual_net(q))
-        mixed_h = self.mixed_memory(h)
-        coupling_matrix = self.q_coupling.weight.unsqueeze(0).expand(h.shape[0], -1, -1)
-        q_coupling = self.q_coupling(mixed_h)
+        coupling_matrix, q_coupling = self._slow_coupling(h)
         dq = -(slow_rates * q) + slow_residual + q_coupling
 
         hidden_operator, fast_rates, hidden_low_rank_coeffs, hidden_sym_eig_upper = self._hidden_operator(q)
         hidden_drive = self.cfg.hidden_drive_scale * torch.tanh(self.h_drive_net(q))
-        dh = -(fast_rates * h) + hidden_drive
+        dh = torch.bmm(hidden_operator, h.unsqueeze(-1)).squeeze(-1) + hidden_drive
 
         return {
             "q": q,
@@ -554,7 +410,6 @@ class LatentRGManifoldAutoencoder(nn.Module):
             "hidden_low_rank_coeffs": hidden_low_rank_coeffs,
             "hidden_drive": hidden_drive,
             "hidden_sym_eig_upper": hidden_sym_eig_upper,
-            "mixed_memory": mixed_h,
             "dq": dq,
             "dh": dh,
             "dm": dh,
@@ -578,11 +433,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
     def hidden_ssm_matrices(self, q: Tensor, *, dt: float) -> dict[str, Tensor]:
         operator, fast_rates, hidden_low_rank_coeffs, hidden_sym_eig_upper = self._hidden_operator(q)
         drive = self.cfg.hidden_drive_scale * torch.tanh(self.h_drive_net(q))
-        dt_value = float(dt)
-        decay = torch.exp(-fast_rates * dt_value)
-        transition = torch.diag_embed(decay)
-        denom = fast_rates.clamp_min(1e-6)
-        bias = ((1.0 - decay) / denom) * drive
+        transition, bias = self._affine_hidden_transition(operator, drive, dt=float(dt))
         return {
             "generator": operator,
             "transition": transition,
@@ -680,7 +531,6 @@ class LatentRGManifoldAutoencoder(nn.Module):
             self.h_low_rank_gate,
             self.hidden_factors,
             self.h_drive_net,
-            self.memory_mixer,
         ]
 
         return {

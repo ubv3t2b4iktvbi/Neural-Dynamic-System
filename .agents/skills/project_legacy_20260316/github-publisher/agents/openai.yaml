@@ -1,0 +1,7 @@
+interface:
+  display_name: "GitHub Publisher"
+  short_description: "Verify, commit, and push the current branch"
+  default_prompt: "Use $github-publisher to verify the current DynamicAlpha Lab changes, create a clean commit, and push the branch to GitHub without force-pushing."
+
+policy:
+  allow_implicit_invocation: true

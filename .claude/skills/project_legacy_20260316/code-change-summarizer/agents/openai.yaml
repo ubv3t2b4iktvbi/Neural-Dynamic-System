@@ -1,0 +1,7 @@
+interface:
+  display_name: "Code Change Summarizer"
+  short_description: "Summarize repo diffs into review-ready updates"
+  default_prompt: "Use $code-change-summarizer to inspect the current DynamicAlpha Lab diff, group changes by subsystem, and produce a concise maintenance summary."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Latent QH Architect"
+  short_description: "Change q/h architecture without breaking training contracts"
+  default_prompt: "Use $latent-qh-architect to modify the q/h latent architecture while keeping CLI, config, model, and training contracts aligned."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Factor Suite Orchestrator"
+  short_description: "Stage factor-mining runs across suites and seeds"
+  default_prompt: "Use $factor-suite-orchestrator to plan a staged factor-mining run order across suites, identifiers, and follow-up checks."
+
+policy:
+  allow_implicit_invocation: true

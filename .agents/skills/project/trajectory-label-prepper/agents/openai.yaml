@@ -1,0 +1,7 @@
+interface:
+  display_name: "Trajectory Label Prepper"
+  short_description: "Validate trajectories, labels, and supervision mappings"
+  default_prompt: "Use $trajectory-label-prepper to inspect trajectory or label files, confirm their shapes, and prepare the right CLI flags for training."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Physics Identifier Swapper"
+  short_description: "Swap identifier backbones without breaking RC screening"
+  default_prompt: "Use $physics-identifier-swapper to compare or add identifier backbones while keeping factor-mining outputs compatible."
+
+policy:
+  allow_implicit_invocation: true
