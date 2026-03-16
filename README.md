@@ -7,18 +7,18 @@
 ```mermaid
 flowchart LR
     classDef io fill:#f6efe4,stroke:#946c3b,stroke-width:1.5px,color:#2b2117;
-    classDef stage fill:#e9f2ea,stroke:#4f7d5c,stroke-width:1.5px,color:#142117;
-    classDef latent fill:#edf3fb,stroke:#4d709e,stroke-width:1.5px,color:#162338;
-    classDef dyn fill:#fff1e3,stroke:#c2762e,stroke-width:1.5px,color:#3f2411;
-    classDef aux fill:#f3edf8,stroke:#7b5ca6,stroke-width:1.5px,color:#251739;
+    classDef stage fill:#eef5ee,stroke:#537d60,stroke-width:1.5px,color:#142117;
+    classDef core fill:#edf3fb,stroke:#4d709e,stroke-width:1.6px,color:#162338;
+    classDef detail fill:#fff1e3,stroke:#c2762e,stroke-width:1.2px,color:#3f2411;
+    classDef aux fill:#f3edf8,stroke:#7b5ca6,stroke-width:1.2px,color:#251739;
 
     subgraph ENC["Encoder"]
         direction TB
         W["输入窗口 W_t"]
-        E["Temporal encoder / MLP backbone E"]
+        E["encoder backbone E"]
         W --> E
 
-        subgraph ESPLIT["多尺度 summary 拆分"]
+        subgraph ESPLIT["multi-scale summaries"]
             direction LR
             UQ["slow summary u_t^(q)"]
             UH["fast summary u_t^(h)"]
@@ -28,33 +28,19 @@ flowchart LR
         E --> UH
     end
 
-    subgraph CORE["Latent Construction + Dynamics"]
+    subgraph CORE["Structured q/h State-Space Core"]
         direction TB
-        K["Koopman head K_theta"]
-        PRAW["raw Koopman features phi_t^raw"]
-        N["running whitening / channel norm"]
-        PHI["Koopman features phi_t"]
-        PF["phi_t^fast"]
-        Q["slow state q_t = phi_t[:d_q]"]
-        HINIT["hidden init H_theta([u_t^(h), phi_t^fast])"]
-        H["fast memory h_t"]
-        Z["latent state z_t = (q_t, h_t)"]
-
-        subgraph STEP["One rollout step"]
+        subgraph META["Block details"]
             direction LR
-            QSTEP["update q with midpoint / RK2"]
-            HGEN["build A(q), b(q)"]
-            HSTEP["update h with exact affine / exp step"]
-            QNEXT["q_(t+1)"]
-            HNEXT["h_(t+1)"]
-            ZNEXT["z_(t+1) = (q_(t+1), h_(t+1))"]
-
-            QSTEP --> QNEXT
-            HGEN --> HSTEP
-            HSTEP --> HNEXT
-            QNEXT --> ZNEXT
-            HNEXT --> ZNEXT
+            D1["Koopman head K_theta -> phi"]
+            D2["q = phi[:d_q], h = H(u^(h), phi_fast)"]
+            D3["q: midpoint, h: exact affine SSM"]
         end
+
+        SSM["做什么：把 slow / fast summaries 变成可解释 latent z_t = (q_t, h_t)，<br/>再用 structured state-space dynamics 推进到 z_(t+1)。"]
+        ZNEXT["next latent z_(t+1)"]
+
+        META --> SSM --> ZNEXT
     end
 
     subgraph DEC["Decoder"]
@@ -66,36 +52,22 @@ flowchart LR
 
     subgraph RGB["RG branch (loss only)"]
         direction TB
-        RGQ["q_tilde = sqrt(lambda_q) * q"]
-        RGH["h_tilde = H_damp(q)^(-1/2) h"]
+        RG1["spectral RG coordinates"]
+        RG2["q_tilde = sqrt(lambda_q) * q<br/>h_tilde = H_damp(q)^(-1/2) h"]
         CG["coarse-grain C_s"]
-        RGQ --> CG
-        RGH --> CG
+        RG1 --> RG2 --> CG
     end
 
-    UQ --> K
-    UH -. "soft_spectrum 时也输入" .-> K
-    K --> PRAW --> N --> PHI
-    PHI --> Q
-    PHI --> PF
-    UH --> HINIT
-    PF --> HINIT
-    HINIT --> H
-    Q --> Z
-    H --> Z
-    Q --> QSTEP
-    H --> QSTEP
-    Q --> HGEN
-    H --> HSTEP
+    UQ --> SSM
+    UH --> SSM
     ZNEXT --> D
-    QNEXT --> RGQ
-    HNEXT --> RGH
+    ZNEXT -. "RG loss only" .-> RG1
 
     class W,XH io;
-    class E,K,N,HINIT,D stage;
-    class UQ,UH,PRAW,PHI,PF,Q,H,Z,QNEXT,HNEXT,ZNEXT latent;
-    class QSTEP,HGEN,HSTEP dyn;
-    class RGQ,RGH,CG aux;
+    class E,D stage;
+    class UQ,UH,SSM,ZNEXT core;
+    class D1,D2,D3 detail;
+    class RG1,RG2,CG aux;
 
     style ENC fill:#fbf7f0,stroke:#cbb18a,stroke-width:1.5px
     style CORE fill:#f7f9fc,stroke:#aac0dd,stroke-width:1.5px
