@@ -187,14 +187,22 @@ class TrainConfig:
     phase3_min_epochs: int = 6
     phase0_reconstruction_improve: float = 0.20
     phase0_koopman_stability_ratio: float = 1.25
+    phase0_reconstruction_target: float | None = None
+    phase0_koopman_loss_ceiling: float | None = None
     phase0_stable_validations: int = 2
     phase1_prediction_improve: float = 0.20
     phase1_q_align_improve: float = 0.20
+    phase1_prediction_target: float | None = None
+    phase1_q_align_target: float | None = None
     phase2_prediction_plateau_tolerance: float = 0.02
     phase2_prediction_plateau_checks: int = 2
     phase2_separation_target: float = 0.08
+    phase2_prediction_plateau_abs_tol: float | None = None
+    phase2_long_horizon_target: float | None = None
     rollback_prediction_worsen_ratio: float = 0.25
     rollback_long_horizon_worsen_ratio: float = 0.35
+    rollback_prediction_worsen_delta: float | None = None
+    rollback_long_horizon_worsen_delta: float | None = None
     rollback_window: int = 2
     rollback_weight_scale: float = 0.5
     log_every: int = 5
@@ -241,6 +249,19 @@ class TrainConfig:
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be >= 0")
+        for name in (
+            "phase0_reconstruction_target",
+            "phase0_koopman_loss_ceiling",
+            "phase1_prediction_target",
+            "phase1_q_align_target",
+            "phase2_prediction_plateau_abs_tol",
+            "phase2_long_horizon_target",
+            "rollback_prediction_worsen_delta",
+            "rollback_long_horizon_worsen_delta",
+        ):
+            value = getattr(self, name)
+            if value is not None and float(value) < 0.0:
+                raise ValueError(f"{name} must be >= 0 when provided")
         if int(self.phase0_stable_validations) < 1:
             raise ValueError("phase0_stable_validations must be >= 1")
         if int(self.phase2_prediction_plateau_checks) < 1:

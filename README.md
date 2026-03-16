@@ -579,36 +579,97 @@ $$
   - `_loss_bundle`
 
 - `neural_dynamic_system/cli.py`
-  - 训练入口
+  - `train` 子命令的训练实现
   - summary 导出
   - koopman / q / h / z probe
 
+- `neural_dynamic_system/app.py`
+  - 根入口
+  - `train / plot / suite` 子命令分发
+
+- `neural_dynamic_system/run_config.py`
+  - YAML / JSON 启动配置读写
+  - 分组参数导出
+  - ablation 运行复用
+
+- `neural_dynamic_system/suite_cli.py`
+  - van der Pol ablation suite
+  - 每个 run 自动导出自己的 `run_config.yaml`
+
+- `neural_dynamic_system/plot_cli.py`
+  - 已完成 run 的单独出图入口
+
+- `neural_dynamic_system/plots.py`
+  - 单次 run 出图
+  - 多 run 对比图
+  - 把画图逻辑和指标汇总逻辑拆开
+
+- `neural_dynamic_system/run_artifacts.py`
+  - 已保存 run 的模型 / 配置 / synthetic 标签回载
+
+- `neural_dynamic_system/synthetic.py`
+  - 当前只保留 van der Pol synthetic 实验面
+  - 统一生成 trajectory / label / probe label
+
 ## 运行方式
 
-一个小的 synthetic smoke test：
+当前默认的 synthetic 实验面只保留 van der Pol。
+
+一个小的 train smoke test：
 
 ```bash
-python -m neural_dynamic_system.cli \
-  --synthetic_kind toy \
+python -m neural_dynamic_system train \
   --num_episodes 2 \
   --steps 256 \
   --obs_dim 6 \
   --window 16 \
-  --q_dim 2 \
-  --h_dim 2 \
-  --koopman_dim 6 \
-  --modal_dim 6 \
-  --hidden_dim 32 \
+  --q_dim 1 \
+  --h_dim 1 \
+  --koopman_dim 4 \
   --batch_size 32 \
   --epochs 2 \
   --horizons 1 2 \
   --out_dir runs/neural_dynamic_system/demo
 ```
 
-也可以直接跑脚本：
+也可以直接跑脚本包装：
 
 ```bash
-python scripts/run_neural_dynamic_system.py --synthetic_kind toy
+python scripts/run_neural_dynamic_system.py --num_episodes 2 --steps 256
+```
+
+也可以把参数保存成 YAML 后一键运行：
+
+```bash
+python scripts/run_neural_dynamic_system.py --config configs/examples/van_demo.yaml
+```
+
+现在每次训练都会把最终生效的启动参数保存为 `run_config.yaml`，方便你做消融时直接复制一份、改少量字段再重跑。
+
+默认 help 现在只显示常用参数；如果要看完整参数面，可以用：
+
+```bash
+python scripts/run_neural_dynamic_system.py --help-expert
+```
+
+phase / curriculum 的细粒度阈值已经从主 CLI 下沉到 YAML 里，推荐直接在 `configs/examples/van_demo.yaml` 或自动导出的 `run_config.yaml` 里改。
+
+跑 van der Pol ablation suite：
+
+```bash
+python -m neural_dynamic_system suite --mode all
+```
+
+或者继续用脚本包装：
+
+```bash
+python scripts/vdp_suite.py --mode all
+```
+
+对已完成 run 单独补图：
+
+```bash
+python -m neural_dynamic_system plot --run_dir runs/neural_dynamic_system/demo
 ```
 
 ## 新增和重要参数
@@ -638,11 +699,19 @@ python scripts/run_neural_dynamic_system.py --synthetic_kind toy
 
 - `model.pt`
 - `history.csv`
+- `run_config.yaml`
 - `config.json`
 - `summary.json`
 - `trajectory_preview.csv`
 - 合成数据时的 `synthetic_hidden_state.csv`
 - probe 结果
+
+如果跑的是 `scripts/vdp_suite.py`，还会额外保存：
+
+- `study_config.json`
+- `study_config.yaml`
+- 每个子 run 目录下各自的 `run_config.yaml`
+- `plot` 子命令重新导出的图目录
 
 现在 probe 会同时评估：
 

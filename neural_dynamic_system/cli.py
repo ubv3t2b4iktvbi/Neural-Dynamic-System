@@ -26,13 +26,108 @@ from neural_dynamic_system import (  # noqa: E402
     generate_synthetic_trajectory,
     load_trajectory,
 )
-from neural_dynamic_system.reporting import build_run_visual_payload, save_single_run_plots  # noqa: E402
+from neural_dynamic_system.plots import save_single_run_plots  # noqa: E402
+from neural_dynamic_system.reporting import build_run_visual_payload  # noqa: E402
+from neural_dynamic_system.run_config import (  # noqa: E402
+    load_cli_defaults,
+    namespace_to_cli_config,
+    resolve_repo_path,
+    write_cli_config,
+)
+
+_HELP_EXPERT_FLAGS = {"--help-expert", "--help-all"}
+_COMMON_TRAIN_ARG_DESTS = frozenset(
+    {
+        "config",
+        "out_dir",
+        "data_path",
+        "array_key",
+        "label_path",
+        "label_array_key",
+        "window",
+        "q_dim",
+        "h_dim",
+        "koopman_dim",
+        "curriculum_preset",
+        "epochs",
+        "batch_size",
+        "lr",
+        "weight_decay",
+        "horizons",
+        "dt",
+        "train_fraction",
+        "device",
+        "progress_bar",
+        "early_stopping",
+        "early_stopping_patience",
+        "early_stopping_min_delta",
+        "seed",
+        "steps",
+        "num_episodes",
+        "obs_dim",
+        "burn_in",
+        "noise_std",
+        "van_der_pol_mu",
+        "eval_batch_size",
+        "trajectory_points",
+        "report_plots",
+    }
+)
+_INTERNAL_TRAIN_DEFAULTS: dict[str, object] = {
+    "schedule_mode": None,
+    "phase0_min_epochs": None,
+    "phase1_min_epochs": None,
+    "phase2_min_epochs": None,
+    "phase3_min_epochs": None,
+    "phase0_reconstruction_improve": None,
+    "phase0_koopman_stability_ratio": None,
+    "phase0_reconstruction_target": None,
+    "phase0_koopman_loss_ceiling": None,
+    "phase0_stable_validations": None,
+    "phase1_prediction_improve": None,
+    "phase1_q_align_improve": None,
+    "phase1_prediction_target": None,
+    "phase1_q_align_target": None,
+    "phase2_prediction_plateau_tolerance": None,
+    "phase2_prediction_plateau_checks": None,
+    "phase2_separation_target": None,
+    "phase2_prediction_plateau_abs_tol": None,
+    "phase2_long_horizon_target": None,
+    "rollback_prediction_worsen_ratio": None,
+    "rollback_long_horizon_worsen_ratio": None,
+    "rollback_prediction_worsen_delta": None,
+    "rollback_long_horizon_worsen_delta": None,
+    "rollback_window": None,
+    "rollback_weight_scale": None,
+    "phase1_fraction": None,
+    "phase2_fraction": None,
+    "phase3_lr_scale": None,
+    "synthetic_kind": "van_der_pol",
+}
 
 
-def parse_args() -> argparse.Namespace:
+def _hide_expert_arguments(parser: argparse.ArgumentParser) -> None:
+    for action in parser._actions:
+        if action.dest == "help" or not action.option_strings:
+            continue
+        if action.dest not in _COMMON_TRAIN_ARG_DESTS:
+            action.help = argparse.SUPPRESS
+
+
+def build_parser(
+    default_overrides: dict[str, object] | None = None,
+    *,
+    show_expert: bool = False,
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a q,h slow-memory latent dynamics model on synthetic or file-based trajectories."
+        description="Train a q,h slow-memory latent dynamics model on synthetic or file-based trajectories.",
+        epilog=(
+            None
+            if show_expert
+            else "Use --help-expert to show the full parameter surface."
+        ),
     )
+    parser.add_argument("--config", type=str, default=None, help="Optional YAML or JSON launch config.")
     parser.add_argument("--out_dir", type=str, default="runs/neural_dynamic_system/demo")
     parser.add_argument("--data_path", type=str, default=None, help="Optional .npy, .npz, or .csv trajectory path.")
     parser.add_argument("--array_key", type=str, default=None, help="Optional NPZ array key.")
@@ -71,7 +166,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--validation_interval", type=int, default=1)
-    parser.add_argument("--schedule_mode", type=str, default=None, choices=["fractional", "metric_driven"])
     parser.add_argument("--progress_bar", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--early_stopping", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--early_stopping_monitor", type=str, default="prediction_loss", choices=["loss", "prediction_loss"])
@@ -79,22 +173,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     parser.add_argument("--early_stopping_min_epochs", type=int, default=None)
     parser.add_argument("--early_stopping_start_phase", type=int, default=3, choices=[0, 1, 2, 3])
-    parser.add_argument("--phase0_min_epochs", type=int, default=None)
-    parser.add_argument("--phase1_min_epochs", type=int, default=None)
-    parser.add_argument("--phase2_min_epochs", type=int, default=None)
-    parser.add_argument("--phase3_min_epochs", type=int, default=None)
-    parser.add_argument("--phase0_reconstruction_improve", type=float, default=None)
-    parser.add_argument("--phase0_koopman_stability_ratio", type=float, default=None)
-    parser.add_argument("--phase0_stable_validations", type=int, default=None)
-    parser.add_argument("--phase1_prediction_improve", type=float, default=None)
-    parser.add_argument("--phase1_q_align_improve", type=float, default=None)
-    parser.add_argument("--phase2_prediction_plateau_tolerance", type=float, default=None)
-    parser.add_argument("--phase2_prediction_plateau_checks", type=int, default=None)
-    parser.add_argument("--phase2_separation_target", type=float, default=None)
-    parser.add_argument("--rollback_prediction_worsen_ratio", type=float, default=None)
-    parser.add_argument("--rollback_long_horizon_worsen_ratio", type=float, default=None)
-    parser.add_argument("--rollback_window", type=int, default=None)
-    parser.add_argument("--rollback_weight_scale", type=float, default=None)
     parser.add_argument("--seed", type=int, default=123)
 
     parser.add_argument(
@@ -112,8 +190,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs_dim", type=int, default=8, help="Synthetic observation dimension when --data_path is omitted.")
     parser.add_argument("--burn_in", type=int, default=256)
     parser.add_argument("--noise_std", type=float, default=0.01)
-    parser.add_argument("--synthetic_kind", type=str, default="toy", choices=["toy", "no_gap_toy", "alanine_like", "van_der_pol"])
-    parser.add_argument("--alanine_fast_dim", type=int, default=4)
     parser.add_argument("--van_der_pol_mu", type=float, default=5.0)
 
     parser.add_argument("--vamp_weight", type=float, default=0.15)
@@ -143,10 +219,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_batch_size", type=int, default=512)
     parser.add_argument("--trajectory_points", type=int, default=400)
     parser.add_argument("--report_plots", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--phase1_fraction", type=float, default=None)
-    parser.add_argument("--phase2_fraction", type=float, default=None)
-    parser.add_argument("--phase3_lr_scale", type=float, default=None)
-    return parser.parse_args()
+    parser.set_defaults(**_INTERNAL_TRAIN_DEFAULTS)
+    if default_overrides:
+        parser.set_defaults(**default_overrides)
+    if not show_expert:
+        _hide_expert_arguments(parser)
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    show_expert = any(flag in argv for flag in _HELP_EXPERT_FLAGS)
+    if show_expert:
+        argv = ["--help" if flag in _HELP_EXPERT_FLAGS else flag for flag in argv]
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", type=str, default=None)
+    known, _ = bootstrap.parse_known_args(argv)
+    defaults = None
+    if known.config:
+        config_path = resolve_repo_path(ROOT, known.config)
+        if config_path is None:
+            raise ValueError("config path must not be empty")
+        defaults = load_cli_defaults(config_path)
+    parser = build_parser(default_overrides=defaults, show_expert=show_expert)
+    return parser.parse_args(argv)
 
 
 def _load_array_with_names(path: Path, *, array_key: str | None = None) -> tuple[np.ndarray, list[str]]:
@@ -204,16 +300,17 @@ def _resolve_curriculum(args: argparse.Namespace) -> dict[str, float | int | str
             "phase1_min_epochs": 12,
             "phase2_min_epochs": 16,
             "phase3_min_epochs": 8,
-            "phase0_reconstruction_improve": 0.20,
-            "phase0_koopman_stability_ratio": 1.20,
+            "phase0_reconstruction_target": 0.20,
+            "phase0_koopman_loss_ceiling": 0.004,
             "phase0_stable_validations": 2,
-            "phase1_prediction_improve": 0.20,
-            "phase1_q_align_improve": 0.20,
-            "phase2_prediction_plateau_tolerance": 0.02,
+            "phase1_prediction_target": 0.12,
+            "phase1_q_align_target": 0.08,
+            "phase2_prediction_plateau_abs_tol": 0.005,
             "phase2_prediction_plateau_checks": 2,
             "phase2_separation_target": 0.08,
-            "rollback_prediction_worsen_ratio": 0.25,
-            "rollback_long_horizon_worsen_ratio": 0.35,
+            "phase2_long_horizon_target": 0.75,
+            "rollback_prediction_worsen_delta": 0.05,
+            "rollback_long_horizon_worsen_delta": 0.20,
             "rollback_window": 2,
             "rollback_weight_scale": 0.50,
         },
@@ -244,12 +341,20 @@ def _resolve_curriculum(args: argparse.Namespace) -> dict[str, float | int | str
     for key in (
         "phase0_reconstruction_improve",
         "phase0_koopman_stability_ratio",
+        "phase0_reconstruction_target",
+        "phase0_koopman_loss_ceiling",
         "phase1_prediction_improve",
         "phase1_q_align_improve",
+        "phase1_prediction_target",
+        "phase1_q_align_target",
         "phase2_prediction_plateau_tolerance",
         "phase2_separation_target",
+        "phase2_prediction_plateau_abs_tol",
+        "phase2_long_horizon_target",
         "rollback_prediction_worsen_ratio",
         "rollback_long_horizon_worsen_ratio",
+        "rollback_prediction_worsen_delta",
+        "rollback_long_horizon_worsen_delta",
         "rollback_weight_scale",
     ):
         value = getattr(args, key)
@@ -487,10 +592,14 @@ def _label_probe(
     return probe_summary, corr_df
 
 
-def main() -> None:
-    args = parse_args()
-    out_dir = ROOT / args.out_dir
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    out_dir = resolve_repo_path(ROOT, args.out_dir)
+    if out_dir is None:
+        raise ValueError("out_dir must not be empty")
     out_dir.mkdir(parents=True, exist_ok=True)
+    effective_run_config = namespace_to_cli_config(args)
+    write_cli_config(out_dir / "run_config.yaml", effective_run_config)
     synthetic_hidden_state = None
     synthetic_supervision_labels = None
     synthetic_supervision_names: list[str] | None = None
@@ -506,19 +615,20 @@ def main() -> None:
     supervision_enabled = any(weight > 0.0 for weight in (args.q_supervised_weight, args.h_supervised_weight))
 
     if args.data_path:
-        data_path = ROOT / args.data_path if not Path(args.data_path).is_absolute() else Path(args.data_path)
+        data_path = resolve_repo_path(ROOT, args.data_path)
+        if data_path is None:
+            raise ValueError("data_path must not be empty")
         trajectory = load_trajectory(data_path, array_key=args.array_key)
         source_summary = {"source": "file", "data_path": str(args.data_path)}
     else:
         synth_cfg = SyntheticTrajectoryConfig(
-            kind=args.synthetic_kind,
+            kind="van_der_pol",
             steps=args.steps,
             dt=args.dt,
             obs_dim=args.obs_dim,
             burn_in=args.burn_in,
             noise_std=args.noise_std,
             seed=args.seed,
-            alanine_fast_dim=args.alanine_fast_dim,
             van_der_pol_mu=args.van_der_pol_mu,
             num_episodes=args.num_episodes,
         )
@@ -586,7 +696,9 @@ def main() -> None:
         )
 
     if args.label_path:
-        label_path = ROOT / args.label_path if not Path(args.label_path).is_absolute() else Path(args.label_path)
+        label_path = resolve_repo_path(ROOT, args.label_path)
+        if label_path is None:
+            raise ValueError("label_path must not be empty")
         label_array, label_names = _load_array_with_names(label_path, array_key=args.label_array_key)
         analysis_label_episodes = coerce_episode_list(label_array, name="analysis_labels", dtype=np.float32)
         analysis_label_names = list(label_names)
@@ -681,14 +793,54 @@ def main() -> None:
         phase3_min_epochs=int(curriculum_cfg.get("phase3_min_epochs", 6)),
         phase0_reconstruction_improve=float(curriculum_cfg.get("phase0_reconstruction_improve", 0.20)),
         phase0_koopman_stability_ratio=float(curriculum_cfg.get("phase0_koopman_stability_ratio", 1.25)),
+        phase0_reconstruction_target=(
+            float(curriculum_cfg["phase0_reconstruction_target"])
+            if "phase0_reconstruction_target" in curriculum_cfg
+            else None
+        ),
+        phase0_koopman_loss_ceiling=(
+            float(curriculum_cfg["phase0_koopman_loss_ceiling"])
+            if "phase0_koopman_loss_ceiling" in curriculum_cfg
+            else None
+        ),
         phase0_stable_validations=int(curriculum_cfg.get("phase0_stable_validations", 2)),
         phase1_prediction_improve=float(curriculum_cfg.get("phase1_prediction_improve", 0.20)),
         phase1_q_align_improve=float(curriculum_cfg.get("phase1_q_align_improve", 0.20)),
+        phase1_prediction_target=(
+            float(curriculum_cfg["phase1_prediction_target"])
+            if "phase1_prediction_target" in curriculum_cfg
+            else None
+        ),
+        phase1_q_align_target=(
+            float(curriculum_cfg["phase1_q_align_target"])
+            if "phase1_q_align_target" in curriculum_cfg
+            else None
+        ),
         phase2_prediction_plateau_tolerance=float(curriculum_cfg.get("phase2_prediction_plateau_tolerance", 0.02)),
         phase2_prediction_plateau_checks=int(curriculum_cfg.get("phase2_prediction_plateau_checks", 2)),
         phase2_separation_target=float(curriculum_cfg.get("phase2_separation_target", 0.08)),
+        phase2_prediction_plateau_abs_tol=(
+            float(curriculum_cfg["phase2_prediction_plateau_abs_tol"])
+            if "phase2_prediction_plateau_abs_tol" in curriculum_cfg
+            else None
+        ),
+        phase2_long_horizon_target=(
+            float(curriculum_cfg["phase2_long_horizon_target"])
+            if "phase2_long_horizon_target" in curriculum_cfg
+            else None
+        ),
         rollback_prediction_worsen_ratio=float(curriculum_cfg.get("rollback_prediction_worsen_ratio", 0.25)),
         rollback_long_horizon_worsen_ratio=float(curriculum_cfg.get("rollback_long_horizon_worsen_ratio", 0.35)),
+        rollback_prediction_worsen_delta=(
+            float(curriculum_cfg["rollback_prediction_worsen_delta"])
+            if "rollback_prediction_worsen_delta" in curriculum_cfg
+            else None
+        ),
+        rollback_long_horizon_worsen_delta=(
+            float(curriculum_cfg["rollback_long_horizon_worsen_delta"])
+            if "rollback_long_horizon_worsen_delta" in curriculum_cfg
+            else None
+        ),
         rollback_window=int(curriculum_cfg.get("rollback_window", 2)),
         rollback_weight_scale=float(curriculum_cfg.get("rollback_weight_scale", 0.5)),
         log_every=args.log_every,
@@ -746,6 +898,8 @@ def main() -> None:
     ).to_csv(out_dir / "trajectory_preview.csv", index=False)
 
     config_payload = {
+        "run_config": effective_run_config,
+        "config_source": args.config,
         "model_config": model_cfg.to_dict(),
         "train_config": train_cfg.to_dict(),
         "curriculum_config": curriculum_cfg,

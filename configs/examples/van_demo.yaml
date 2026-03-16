@@ -1,0 +1,113 @@
+schema_version: 1
+run:
+  out_dir: runs/neural_dynamic_system/van_demo_yaml
+data:
+  data_path: null
+  array_key: null
+  label_path: null
+  label_array_key: null
+model:
+  window: 32
+  q_dim: 1
+  h_dim: 1
+  koopman_dim: 4
+  latent_scheme: soft_spectrum
+  koopman_input_mode: slow_only
+  hidden_coordinate_mode: normal_residual
+  modal_dim: 4
+  modal_temperature: 0.35
+  encoder_type: temporal_conv
+  encoder_levels: 3
+  encoder_kernel_size: 5
+  hidden_dim: 64
+  depth: 2
+  vamp_head_depth: 1
+  vamp_whitening_momentum: 0.05
+  vamp_whitening_eps: 1.0e-05
+  hidden_rank: 1
+  rg_scale: 2.0
+  coarse_strength: 0.25
+  rg_temperature: 0.35
+curriculum:
+  curriculum_preset: vdp_structured
+  epochs: 24
+  phase0_min_epochs: 8
+  phase1_min_epochs: 12
+  phase2_min_epochs: 16
+  phase3_min_epochs: 8
+  phase0_reconstruction_improve: null
+  phase0_koopman_stability_ratio: null
+  phase0_reconstruction_target: 0.2
+  phase0_koopman_loss_ceiling: 0.004
+  phase0_stable_validations: 2
+  phase1_prediction_improve: null
+  phase1_q_align_improve: null
+  phase1_prediction_target: 0.12
+  phase1_q_align_target: 0.08
+  phase2_prediction_plateau_tolerance: null
+  phase2_prediction_plateau_checks: 2
+  phase2_separation_target: 0.08
+  phase2_prediction_plateau_abs_tol: 0.005
+  phase2_long_horizon_target: 0.75
+  rollback_prediction_worsen_ratio: null
+  rollback_long_horizon_worsen_ratio: null
+  rollback_prediction_worsen_delta: 0.05
+  rollback_long_horizon_worsen_delta: 0.2
+  rollback_window: 2
+  rollback_weight_scale: 0.5
+  phase1_fraction: 0.3
+  phase2_fraction: 0.8
+  phase3_lr_scale: 0.35
+train:
+  batch_size: 256
+  lr: 0.001
+  weight_decay: 1.0e-05
+  horizons: [1, 2, 4, 8, 16]
+  dt: 0.02
+  train_fraction: 0.8
+  device: auto
+  log_every: 2
+  validation_interval: 1
+  schedule_mode: metric_driven
+  progress_bar: true
+  early_stopping: true
+  early_stopping_monitor: prediction_loss
+  early_stopping_patience: 6
+  early_stopping_min_delta: 0.0001
+  early_stopping_min_epochs: null
+  early_stopping_start_phase: 3
+  contract_batch: 16
+  rg_horizon: 1
+  eval_batch_size: 512
+  seed: 123
+synthetic:
+  steps: 1024
+  num_episodes: 8
+  obs_dim: 6
+  burn_in: 256
+  noise_std: 0.01
+  synthetic_kind: van_der_pol
+  van_der_pol_mu: 5.0
+loss:
+  vamp_weight: 0.15
+  vamp_align_weight: 0.25
+  koopman_weight: 0.2
+  diag_weight: 0.02
+  latent_align_weight: 0.0
+  semigroup_weight: 0.35
+  contract_weight: 0.2
+  separation_weight: 0.2
+  rg_weight: 0.0
+  metric_weight: 0.05
+  metric_mode: mahalanobis_dynamics
+  hidden_l1_weight: 0.0001
+supervision:
+  q_label_indices: null
+  h_label_indices: null
+  q_supervised_weight: 0.0
+  q_supervision_mode: direct
+  h_supervised_weight: 0.0
+  label_standardize: true
+reporting:
+  trajectory_points: 400
+  report_plots: true

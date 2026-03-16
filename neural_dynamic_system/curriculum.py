@@ -381,28 +381,58 @@ class MetricDrivenPhaseController:
             self._tracker.stable_validations = 0
             return False, "validation metrics not finite"
         phase_epochs = int(epoch - self._tracker.entry_epoch + 1)
-        koopman_entry = float(self._tracker.entry["koopman_loss"])
-        koopman_limit = max(
-            koopman_entry * float(self.train_cfg.phase0_koopman_stability_ratio),
-            koopman_entry + 1e-6,
-        )
-        if float(metrics["koopman_loss"]) <= koopman_limit:
+        koopman_ceiling = self.train_cfg.phase0_koopman_loss_ceiling
+        if koopman_ceiling is not None:
+            koopman_ok = float(metrics["koopman_loss"]) <= float(koopman_ceiling)
+        else:
+            koopman_entry = float(self._tracker.entry["koopman_loss"])
+            koopman_limit = max(
+                koopman_entry * float(self.train_cfg.phase0_koopman_stability_ratio),
+                koopman_entry + 1e-6,
+            )
+            koopman_ok = float(metrics["koopman_loss"]) <= koopman_limit
+        if koopman_ok:
             self._tracker.stable_validations += 1
         else:
             self._tracker.stable_validations = 0
+        rec_target = self.train_cfg.phase0_reconstruction_target
         rec_gain = _relative_improvement(
             float(self._tracker.entry["reconstruction_loss"]),
             float(metrics["reconstruction_loss"]),
         )
+        rec_ok = (
+            float(metrics["reconstruction_loss"]) <= float(rec_target)
+            if rec_target is not None
+            else rec_gain >= float(self.train_cfg.phase0_reconstruction_improve)
+        )
         ready = (
             phase_epochs >= int(self.spec.min_epochs)
-            and rec_gain >= float(self.train_cfg.phase0_reconstruction_improve)
+            and rec_ok
             and self._tracker.stable_validations >= int(self.train_cfg.phase0_stable_validations)
         )
-        reason = (
-            f"reconstruction improved by {rec_gain:.1%} after {phase_epochs} epoch(s); "
-            f"{self._tracker.stable_validations} stable validation(s)"
-        )
+        if rec_target is not None or koopman_ceiling is not None:
+            rec_clause = (
+                f"reconstruction={float(metrics['reconstruction_loss']):.4f}"
+                f" <= {float(rec_target):.4f}"
+                if rec_target is not None
+                else f"reconstruction improved by {rec_gain:.1%}"
+            )
+            koop_clause = (
+                f"koopman={float(metrics['koopman_loss']):.4f}"
+                f" <= {float(koopman_ceiling):.4f}"
+                if koopman_ceiling is not None
+                else f"stable validations={self._tracker.stable_validations}"
+            )
+            reason = (
+                f"{rec_clause} after {phase_epochs} epoch(s); "
+                f"{koop_clause}; "
+                f"stable validations={self._tracker.stable_validations}"
+            )
+        else:
+            reason = (
+                f"reconstruction improved by {rec_gain:.1%} after {phase_epochs} epoch(s); "
+                f"{self._tracker.stable_validations} stable validation(s)"
+            )
         return ready, reason
 
     def _phase1_ready(self, epoch: int, metrics: Mapping[str, float]) -> tuple[bool, str]:
@@ -416,32 +446,74 @@ class MetricDrivenPhaseController:
             float(self._tracker.entry["q_align_loss"]),
             float(metrics["q_align_loss"]),
         )
+        pred_target = self.train_cfg.phase1_prediction_target
+        align_target = self.train_cfg.phase1_q_align_target
+        pred_ok = (
+            float(metrics["one_step_prediction_loss"]) <= float(pred_target)
+            if pred_target is not None
+            else pred_gain >= float(self.train_cfg.phase1_prediction_improve)
+        )
+        align_ok = (
+            float(metrics["q_align_loss"]) <= float(align_target)
+            if align_target is not None
+            else align_gain >= float(self.train_cfg.phase1_q_align_improve)
+        )
         stable_hidden = float(metrics["hidden_sym_eig_upper"]) < 0.0
         ready = (
             phase_epochs >= int(self.spec.min_epochs)
-            and pred_gain >= float(self.train_cfg.phase1_prediction_improve)
-            and align_gain >= float(self.train_cfg.phase1_q_align_improve)
+            and pred_ok
+            and align_ok
             and stable_hidden
         )
-        reason = (
-            f"1-step prediction improved by {pred_gain:.1%} after {phase_epochs} epoch(s); "
-            f"q-align improved by {align_gain:.1%}; "
-            f"hidden_sym_eig_upper={float(metrics['hidden_sym_eig_upper']):.4f}"
-        )
+        if pred_target is not None or align_target is not None:
+            pred_clause = (
+                f"1-step prediction={float(metrics['one_step_prediction_loss']):.4f}"
+                f" <= {float(pred_target):.4f}"
+                if pred_target is not None
+                else f"1-step prediction improved by {pred_gain:.1%}"
+            )
+            align_clause = (
+                f"q-align={float(metrics['q_align_loss']):.4f}"
+                f" <= {float(align_target):.4f}"
+                if align_target is not None
+                else f"q-align improved by {align_gain:.1%}"
+            )
+            reason = (
+                f"{pred_clause} after {phase_epochs} epoch(s); "
+                f"{align_clause}; "
+                f"hidden_sym_eig_upper={float(metrics['hidden_sym_eig_upper']):.4f}"
+            )
+        else:
+            reason = (
+                f"1-step prediction improved by {pred_gain:.1%} after {phase_epochs} epoch(s); "
+                f"q-align improved by {align_gain:.1%}; "
+                f"hidden_sym_eig_upper={float(metrics['hidden_sym_eig_upper']):.4f}"
+            )
         return ready, reason
 
     def _phase2_ready(self, epoch: int, metrics: Mapping[str, float]) -> tuple[bool, str]:
         phase_epochs = int(epoch - self._tracker.entry_epoch + 1)
         best_prediction = float(self._tracker.best_prediction or metrics["prediction_loss"])
         current_prediction = float(metrics["prediction_loss"])
+        abs_tol = self.train_cfg.phase2_prediction_plateau_abs_tol
         tolerance = float(self.train_cfg.phase2_prediction_plateau_tolerance)
-        if current_prediction < best_prediction * (1.0 - tolerance):
+        improved = (
+            current_prediction < (best_prediction - float(abs_tol))
+            if abs_tol is not None
+            else current_prediction < best_prediction * (1.0 - tolerance)
+        )
+        if improved:
             self._tracker.best_prediction = current_prediction
             self._tracker.plateau_checks = 0
         else:
             self._tracker.plateau_checks += 1
         best_long = float(self._tracker.best_long_horizon or metrics["long_horizon_prediction_loss"])
-        long_ok = float(metrics["long_horizon_prediction_loss"]) <= best_long * (1.0 + tolerance)
+        long_target = self.train_cfg.phase2_long_horizon_target
+        long_ok = (
+            float(metrics["long_horizon_prediction_loss"]) <= float(long_target)
+            if long_target is not None
+            else float(metrics["long_horizon_prediction_loss"]) <= best_long * (1.0 + tolerance)
+        )
         separation_ok = float(metrics["separation_loss"]) <= float(self.train_cfg.phase2_separation_target)
         ready = (
             phase_epochs >= int(self.spec.min_epochs)
@@ -449,11 +521,29 @@ class MetricDrivenPhaseController:
             and long_ok
             and self._tracker.plateau_checks >= int(self.train_cfg.phase2_prediction_plateau_checks)
         )
-        reason = (
-            f"plateau checks={self._tracker.plateau_checks} after {phase_epochs} epoch(s); "
-            f"separation={float(metrics['separation_loss']):.4f}; "
-            f"long_horizon={float(metrics['long_horizon_prediction_loss']):.4f}"
-        )
+        if abs_tol is not None or long_target is not None:
+            plateau_clause = (
+                f"prediction plateau abs_tol={float(abs_tol):.4f}"
+                if abs_tol is not None
+                else f"plateau checks={self._tracker.plateau_checks}"
+            )
+            long_clause = (
+                f"long_horizon={float(metrics['long_horizon_prediction_loss']):.4f}"
+                f" <= {float(long_target):.4f}"
+                if long_target is not None
+                else f"long_horizon={float(metrics['long_horizon_prediction_loss']):.4f}"
+            )
+            reason = (
+                f"{plateau_clause}; checks={self._tracker.plateau_checks} after {phase_epochs} epoch(s); "
+                f"separation={float(metrics['separation_loss']):.4f}; "
+                f"{long_clause}"
+            )
+        else:
+            reason = (
+                f"plateau checks={self._tracker.plateau_checks} after {phase_epochs} epoch(s); "
+                f"separation={float(metrics['separation_loss']):.4f}; "
+                f"long_horizon={float(metrics['long_horizon_prediction_loss']):.4f}"
+            )
         return ready, reason
 
     def _rollback_needed(self, metrics: Mapping[str, float]) -> tuple[bool, str]:
@@ -465,11 +555,21 @@ class MetricDrivenPhaseController:
             return False, ""
         pred_ref = float(self._rollback_reference["one_step_prediction_loss"])
         long_ref = float(self._rollback_reference["long_horizon_prediction_loss"])
-        pred_worse = float(metrics["one_step_prediction_loss"]) > pred_ref * (
-            1.0 + float(self.train_cfg.rollback_prediction_worsen_ratio)
+        pred_delta = self.train_cfg.rollback_prediction_worsen_delta
+        long_delta = self.train_cfg.rollback_long_horizon_worsen_delta
+        pred_worse = (
+            float(metrics["one_step_prediction_loss"]) > pred_ref + float(pred_delta)
+            if pred_delta is not None
+            else float(metrics["one_step_prediction_loss"]) > pred_ref * (
+                1.0 + float(self.train_cfg.rollback_prediction_worsen_ratio)
+            )
         )
-        long_worse = float(metrics["long_horizon_prediction_loss"]) > long_ref * (
-            1.0 + float(self.train_cfg.rollback_long_horizon_worsen_ratio)
+        long_worse = (
+            float(metrics["long_horizon_prediction_loss"]) > long_ref + float(long_delta)
+            if long_delta is not None
+            else float(metrics["long_horizon_prediction_loss"]) > long_ref * (
+                1.0 + float(self.train_cfg.rollback_long_horizon_worsen_ratio)
+            )
         )
         hidden_unstable = float(metrics["hidden_sym_eig_upper"]) > 0.0
         if pred_worse or long_worse or hidden_unstable:
