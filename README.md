@@ -1,38 +1,39 @@
 # Neural Dynamic System
 
-Neural Dynamic System is a latent dynamics framework for learning slow collective coordinates, unresolved-memory closure, multiscale coarse graining, and manifold reconstruction from time-series trajectories. The implementation in this repository combines four ideas into one trainable model:
+这个 README 只描述当前仓库里实际实现的模型与训练流程，不再沿用旧版 `q,m` 叙事。
 
-1. Koopman / VAMP-style slow coordinate discovery.
-2. Mori-Zwanzig-inspired memory augmentation.
-3. Renormalization-group-like coarse graining in latent space.
-4. Slow-manifold decoding for reconstructing observables.
-
-The code is organized around a latent split
+当前代码里的真实 latent state 是
 
 $$
-z_t = (q_t, m_t),
+z_t = (q_t, h_t),
 $$
 
-where $q_t$ represents slow coordinates and $m_t$ represents unresolved memory variables. The model reads a short observation window
+其中：
 
-$$
-W_t = [x_{t-L+1}, x_{t-L+2}, \ldots, x_t], \qquad x_t \in \mathbb{R}^d,
-$$
+- `q_t` 是慢变量 / 慢坐标。
+- `h_t` 是隐藏快变量，也是当前代码里承担 closure / memory embedding 作用的状态。
+- CLI 和部分导出字段里仍保留 `--m_dim`、`memory_rate_mean`、`m_supervised_weight` 这类名字作为兼容别名，但它们在实现上都等价于当前的 `h`。
 
-encodes it into $(q_t, m_t)$, evolves the latent state with a neural dynamics model, and decodes back to the observation space.
+一句话概括当前实现：
 
-## Why this repo exists
+> 这是一个“窗口编码 + 慢变量 `q` + 条件化隐藏状态空间 `h` + 结构化解码器 + 多步一致性训练”的模型；它已经具备把隐藏子系统改写成 SSD / selective scan 风格内核的接口条件，但整个系统还不是完整的 Mamba kernel。
 
-Many real systems are not well described by a single Markovian low-dimensional latent ODE. Molecular dynamics, climate subgrid closure, reaction networks, and strongly multiscale systems often contain:
+## 当前实现包含什么
 
-- slow reaction coordinates,
-- fast unresolved modes,
-- nonlocal memory effects,
-- scale-dependent effective dynamics.
+当前仓库把下面几件事放在了同一个可训练模型里：
 
-This repository tries to model all of them jointly. Instead of assuming that a slow latent code alone is sufficient, it explicitly introduces a memory block $m_t$, regularizes time-scale separation, and imposes an RG-like consistency relation between fine and coarse latent dynamics.
+1. 从窗口序列里提取慢坐标 `q`，并用 VAMP 风格目标约束其时间相关结构。
+2. 用一个 `q` 条件化的仿射隐藏状态空间来表示快变量 / closure 状态 `h`。
+3. 用结构化解码器
 
-## Repository structure
+   $$
+   \hat x_t = g(q_t) + B(q_t) h_t
+   $$
+
+   把“慢流形主项”和“离流形修正项”分开。
+4. 用多步 rollout、一致性、半群、RG-like 约束把 latent dynamics 训练成真正可推进的动力系统，而不只是一个自编码器。
+
+## 仓库结构
 
 ```text
 neural_dynamic_system/
@@ -48,29 +49,27 @@ scripts/
 README.md
 ```
 
-Core module mapping:
+核心文件：
 
-- `neural_dynamic_system/model.py`: encoder, latent dynamics, decoder, slow-manifold projection, RG coarse graining.
-- `neural_dynamic_system/training.py`: VAMP/Koopman/MZ/RG-related loss terms and curriculum training.
-- `neural_dynamic_system/data.py`: windowed dataset construction and train/validation split.
-- `neural_dynamic_system/synthetic.py`: toy, no-gap toy, and alanine-like synthetic trajectory generators.
-- `neural_dynamic_system/cli.py`: command-line training entrypoint.
-- `scripts/run_neural_dynamic_system.py`: thin wrapper around the package CLI.
+- `neural_dynamic_system/model.py`：编码器、`q/h` latent 表示、动力学、解码器、coarse graining。
+- `neural_dynamic_system/training.py`：损失函数、课程训练、checkpoint 选择。
+- `neural_dynamic_system/data.py`：窗口采样、标准化、train/val 拆分。
+- `neural_dynamic_system/synthetic.py`：`toy`、`no_gap_toy`、`alanine_like` 合成数据。
+- `neural_dynamic_system/cli.py`：命令行入口、产物导出、线性 probe。
 
-## Installation
+## 安装
 
-This repository currently does not ship a `pyproject.toml` or `requirements.txt`, so install the runtime dependencies manually:
+仓库目前没有 `pyproject.toml`，运行依赖需要手动安装：
 
 ```bash
 pip install torch numpy pandas
-pip install torchdiffeq  # optional, enables Dopri5 latent integration
 ```
 
-If `torchdiffeq` is not installed, the model still works and falls back to the built-in latent stepper.
+当前实现没有使用 `torchdiffeq`；旧 README 里那段可选 ODE solver 说明已经不适用了。
 
-## Quick start
+## 快速开始
 
-Run a small synthetic experiment:
+运行一个小的 `toy` 合成实验：
 
 ```bash
 python -m neural_dynamic_system.cli \
@@ -80,13 +79,13 @@ python -m neural_dynamic_system.cli \
   --obs_dim 8 \
   --window 32 \
   --q_dim 2 \
-  --m_dim 2 \
+  --h_dim 2 \
   --latent_scheme soft_spectrum \
   --modal_dim 8 \
   --out_dir runs/neural_dynamic_system/toy_demo
 ```
 
-Equivalent script entry:
+等价脚本入口：
 
 ```bash
 python scripts/run_neural_dynamic_system.py \
@@ -94,7 +93,7 @@ python scripts/run_neural_dynamic_system.py \
   --out_dir runs/neural_dynamic_system/toy_demo
 ```
 
-Run the alanine-like benchmark:
+运行 `alanine_like` 基准：
 
 ```bash
 python -m neural_dynamic_system.cli \
@@ -104,534 +103,833 @@ python -m neural_dynamic_system.cli \
   --obs_dim 16 \
   --window 64 \
   --q_dim 2 \
-  --m_dim 4 \
+  --h_dim 4 \
   --latent_scheme soft_spectrum \
   --modal_dim 12 \
   --curriculum_preset alanine_bootstrap \
   --out_dir runs/neural_dynamic_system/alanine_like
 ```
 
-Train on your own trajectory array:
+训练自定义轨迹：
 
 ```bash
 python -m neural_dynamic_system.cli \
   --data_path path/to/trajectory.npy \
   --window 64 \
   --q_dim 3 \
-  --m_dim 3 \
+  --h_dim 3 \
   --horizons 1 2 4 8 \
   --out_dir runs/neural_dynamic_system/custom_run
 ```
 
-Supported input formats:
+## 数据格式与采样行为
 
-- `.npy`
-- `.npz`
-- `.csv`
+`data.py` 里支持的输入轨迹格式是：
 
-Optional aligned label arrays can be passed with `--label_path` for supervised probing or partial latent supervision.
+- `1D` 数组：自动视为单变量时间序列，reshape 成 `[T, 1]`
+- `2D` 数组：`[T, d]`
+- `3D` 数组：`[N, T, d]`
+- `Sequence[np.ndarray]`：每个 episode 一条轨迹，允许不同长度
+- 文件格式：`.npy`、`.npz`、`.csv`、`.txt`
 
-## Output files
+标签 `labels` 需要和轨迹保持相同的 episode 结构与步数。
 
-Each run writes artifacts under `--out_dir`:
-
-- `model.pt`: model state, configs, normalization statistics, and optional label statistics.
-- `history.csv`: per-epoch train/validation metrics.
-- `config.json`: data source, configs, and normalization metadata.
-- `summary.json`: best validation metrics and latent-spectrum summary.
-- `trajectory_preview.csv`: first 512 standardized observation steps for inspection.
-- `synthetic_hidden_state.csv`: hidden latent truth for synthetic benchmarks.
-- `synthetic_labels.csv`: synthetic supervision labels when available.
-- `synthetic_probe_labels.csv`: held-out probe labels for synthetic evaluation.
-- `label_probe.json` or `synthetic_hidden_probe.json`: downstream probe scores.
-- `label_component_corrs.csv` or `synthetic_component_corrs.csv`: best component-label correlations.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A["Observation window W_t = [x_{t-L+1}, ..., x_t]"] --> B["Temporal / MLP encoder"]
-    B --> C["q_hidden"]
-    B --> D["memory_hidden"]
-    C --> E["Optional soft spectrum modal block"]
-    D --> E
-    E --> F["VAMP head + whitening -> q_t"]
-    E --> G["Memory head -> m_t"]
-    F --> H["Latent state z_t = (q_t, m_t)"]
-    G --> H
-    H --> I["Latent dynamics"]
-    I --> J["dq/dt = r_q(q,m) odot tanh(f_q(q,m))"]
-    I --> K["dm/dt = -r_m(q,m) odot m + K_theta(q,m)"]
-    H --> L["Decoder"]
-    L --> M["Slow manifold base g(q)"]
-    L --> N["Memory correction B(q)m"]
-    M --> O["Reconstruction x_hat_t"]
-    N --> O
-    H --> P["Coarse graining C(z)"]
-    P --> Q["RG consistency loss"]
-    H --> R["Latent rollout Phi_h(z_t)"]
-    R --> S["Prediction / latent alignment / semigroup losses"]
-    F --> T["VAMP-2 + time-lag diagonalization"]
-    E --> U["Koopman modal decay loss"]
-```
-
-## Mathematical formulation
-
-### 1. Windowed latent encoding
-
-The input is a context window $W_t \in \mathbb{R}^{L \times d}$. The encoder produces two hidden summaries:
+给定窗口长度 `L` 和 horizon 集合 `\mathcal H`，`ArrayTrajectoryDataset` 的一个训练样本是：
 
 $$
-(h_t^{(q)}, h_t^{(m)}) = E_\theta(W_t).
-$$
-
-In `temporal_conv` mode, `TemporalMultiscaleEncoder` applies multiscale 1D convolutions and residual blocks over time. In `mlp` mode, the window is flattened and processed by an MLP.
-
-There are two latent partition schemes.
-
-#### Hard split
-
-The simplest scheme directly assigns
-
-$$
-q_t^{\text{src}} = h_t^{(q)}, \qquad m_t^{\text{src}} = h_t^{(m)}.
-$$
-
-#### Soft spectrum
-
-The more interesting scheme first learns modal coordinates
-
-$$
-a_t = \tanh(f_{\text{modal}}([h_t^{(q)}, h_t^{(m)}])) \in \mathbb{R}^K.
-$$
-
-Each mode gets a positive decay rate
-
-$$
-\lambda_k = \lambda_{\min}^{(q)} + \mathrm{softplus}(\theta_k),
-$$
-
-and the model constructs slow and memory weights from the log-spectrum:
-
-$$
-\ell_k = \frac{\log \lambda_k - \frac{1}{K}\sum_j \log \lambda_j}{\tau},
+W_t = [x_{t-L+1}, \dots, x_t] \in \mathbb{R}^{L \times d},
 $$
 
 $$
-w_k^{\text{slow}} = \frac{e^{-\ell_k}}{\sum_j e^{-\ell_j}}, \qquad
-w_k^{\text{mem}} = \frac{e^{\ell_k}}{\sum_j e^{\ell_j}},
+x_t = W_t[-1],
 $$
 
-where $\tau$ is `modal_temperature`.
-
-The same modal vector is then partitioned softly:
-
 $$
-q_t^{\text{src}} = a_t \odot w^{\text{slow}}, \qquad
-m_t^{\text{src}} = a_t \odot w^{\text{mem}}.
+\{x_{t+h}\}_{h \in \mathcal H},
 $$
 
-This is a useful compromise between a fully hand-engineered split and a completely entangled latent code.
+以及对应的未来窗口
 
-### 2. VAMP whitening and slow coordinates
+$$
+W_{t+h} = [x_{t-L+1+h}, \dots, x_{t+h}].
+$$
 
-The slow coordinate head computes
+代码里的拆分和标准化行为也很具体：
+
+1. 先按 episode 做 train/val 切分。
+2. 观测标准化只用 train 段统计量：
+
+   $$
+   x \mapsto \frac{x - \mu_{\text{train}}}{\sigma_{\text{train}} + 10^{-6}}.
+   $$
+
+3. validation 的起点不是简单的 `split_index`，而是
+
+   $$
+   \text{val\_start} = \max(\text{split\_index} - L - \max \mathcal H,\ 0),
+   $$
+
+   这样验证集也能构造完整窗口和未来目标。
+4. 如果提供标签，标签也按同样的 episode 切分；默认还会做基于 train split 的标准化。
+5. 当 `--q_supervision_mode angular` 且 `q` 监督权重大于零时，对应 `q` 标签维度不会做标准化。
+
+## 输出文件
+
+每次运行会在 `--out_dir` 下写出：
+
+- `model.pt`：模型参数、`model_config`、`train_config`、`loss_config`、轨迹标准化统计量、可选 `label_stats`
+- `history.csv`：每个 epoch 的 train/val 指标
+- `config.json`：数据源、配置、标准化信息、标签名、synthetic metadata
+- `summary.json`：最佳验证指标、phase 选择信息、soft spectrum 摘要
+- `trajectory_preview.csv`：每个 episode 前 512 步观测
+- `synthetic_hidden_state.csv`：仅合成数据时输出
+- `synthetic_labels.csv`：仅合成数据且存在监督标签时输出
+- `synthetic_probe_labels.csv`：仅合成数据且存在 probe 标签时输出
+- `label_probe.json`：存在显式标签训练/评估时输出
+- `synthetic_hidden_probe.json`：未提供标签但使用合成 probe 标签时输出
+- `label_component_corrs.csv` 或 `synthetic_component_corrs.csv`：最佳 latent-component 相关性
+
+有两个实现细节值得知道：
+
+1. 训练结束后，代码会加载“最高 phase 中验证集最好的 checkpoint”，不一定是全程全局最小 loss 的那个；`summary.json` 里会同时记录 `overall_best_val_loss`。
+2. `eval_batch_size` 只用于导出后的线性 probe，不参与主训练。
+
+## 数学模型
+
+### 1. 窗口编码
+
+输入是标准化后的窗口
+
+$$
+W_t = [x_{t-L+1}, \dots, x_t] \in \mathbb{R}^{L \times d}.
+$$
+
+编码器输出两路 hidden summary：
+
+$$
+(u_t^{(q)}, u_t^{(h)}) = E_\theta(W_t).
+$$
+
+当前有两种编码器：
+
+#### `temporal_conv`
+
+`TemporalMultiscaleEncoder` 先把输入转成 `[B, d, L]`，再通过：
+
+- 一个 stem `Conv1d`
+- 多层残差时序卷积块
+- 层间 stride-2 下采样
+- 一个 bottleneck 残差块
+
+得到多尺度 summary。实现上的分工是：
+
+- `q` 分支只看 bottleneck 的时间平均；
+- `h` 分支看 bottleneck 加上所有尺度 summary 的拼接。
+
+所以可以抽象地写成
+
+$$
+u_t^{(q)} = P_q(\bar h_t^{\text{bottleneck}}),
+$$
+
+$$
+u_t^{(h)} = P_h([\bar h_t^{(1)}, \dots, \bar h_t^{(J)}, \bar h_t^{\text{bottleneck}}]).
+$$
+
+#### `mlp`
+
+窗口直接 flatten 成 `Ld` 维向量，再经过 MLP：
+
+$$
+u_t^{(q)} = u_t^{(h)} = \operatorname{MLP}(\operatorname{vec}(W_t)).
+$$
+
+### 2. Latent 分配：`hard_split` 与 `soft_spectrum`
+
+#### `hard_split`
+
+直接把编码器输出送进两条头：
+
+$$
+q_t^{\text{src}} = u_t^{(q)}, \qquad h_t^{\text{src}} = u_t^{(h)}.
+$$
+
+#### `soft_spectrum`
+
+先学习共享 modal coordinates：
+
+$$
+a_t = \tanh\!\Big(f_{\text{modal}}([u_t^{(q)}, u_t^{(h)}])\Big) \in \mathbb{R}^{K}.
+$$
+
+每个 mode 还带一个全局可训练正 decay rate：
+
+$$
+\lambda_k = \lambda_{\min}^{\text{slow}} + \operatorname{softplus}(\theta_k).
+$$
+
+对 log-rate 做居中和温度缩放：
+
+$$
+c_k = \frac{\log \lambda_k - \frac{1}{K}\sum_{j=1}^{K}\log \lambda_j}{\tau},
+$$
+
+其中 `\tau = modal_temperature`。
+
+然后构造两组 soft partition 权重：
+
+$$
+w_k^{(q)} = \frac{e^{-c_k}}{\sum_j e^{-c_j}},
+\qquad
+w_k^{(h)} = \frac{e^{c_k}}{\sum_j e^{c_j}}.
+$$
+
+最终送入两条头的是
+
+$$
+q_t^{\text{src}} = a_t \odot w^{(q)},
+\qquad
+h_t^{\text{src}} = a_t \odot w^{(h)}.
+$$
+
+这里有一个非常重要的实现事实：
+
+- 这组 `modal_rates = \lambda_k` 只用于 encoder 侧的 modal split 和 Koopman-style modal decay loss。
+- 真正用于 latent rollout 的慢/快时间尺度，是后面动力学里单独学出来的 `slow_rates(q)` 和 `fast_rates(q)`。
+
+也就是说，当前代码里有“两套速率”：
+
+1. `modal_rates`：给 soft spectrum 和 Koopman modal loss 用。
+2. `slow_rates / fast_rates`：给真实动力学推进用。
+
+### 3. 慢变量头、VAMP whitening 与隐藏头
+
+慢变量头先产生未白化特征：
 
 $$
 \tilde q_t = f_{\text{vamp}}(q_t^{\text{src}}).
 $$
 
-`RunningWhitenedVAMP` maintains a running mean $\mu$ and covariance $C$ and outputs
+`RunningWhitenedVAMP` 维护运行均值和协方差：
+
+$$
+\mu_{\text{run}}, \qquad C_{\text{run}}.
+$$
+
+训练时如果 batch size 大于 1，会用当前 batch 的统计量做指数滑动更新；输出的 whitened slow coordinate 是
 
 $$
 q_t = (\tilde q_t - \mu) C^{-1/2}.
 $$
 
-This whitening matters because Koopman/VAMP objectives are easiest to optimize when slow features are approximately decorrelated and normalized.
+其中 `C^{-1/2}` 通过特征分解计算，且 whitening 矩阵在代码里是 `detach` 的，所以梯度不会穿过协方差估计本身。
 
-The memory state is produced by a linear head:
-
-$$
-m_t = W_m m_t^{\text{src}} + b_m.
-$$
-
-Finally,
+隐藏变量头是一个线性层：
 
 $$
-z_t = [q_t, m_t].
+h_t = W_h h_t^{\text{src}} + b_h.
 $$
 
-### 3. Koopman viewpoint
-
-For a suitable observable dictionary, Koopman theory suggests approximately linear time evolution:
+最终 latent state 为
 
 $$
-\psi(x_{t+\tau}) \approx K_\tau \psi(x_t).
+z_t = [q_t, h_t] \in \mathbb{R}^{d_q + d_h}.
 $$
 
-This repository uses two complementary approximations to that idea.
+### 4. 最终连续时间动力学
 
-#### 3.1 VAMP-2 objective
+当前代码里的真实动力学不是旧 README 那种“通用非线性 `m` 方程”，而是下面这个更结构化的 `q/h` 系统。
 
-Given batch matrices $Q_0$ and $Q_\tau$ of whitened slow features from lagged windows, define centered versions
+#### 4.1 慢变量 `q`
 
-$$
-\bar Q_0 = Q_0 - \mathrm{mean}(Q_0), \qquad
-\bar Q_\tau = Q_\tau - \mathrm{mean}(Q_\tau).
-$$
-
-Then
+定义：
 
 $$
-C_{00} = \frac{1}{B-1}\bar Q_0^\top \bar Q_0 + \epsilon I,
+r_q(q) = r_{q,\min} + \operatorname{softplus}(f_{q,\text{rate}}(q)) \in \mathbb{R}^{d_q},
 $$
 
 $$
-C_{\tau\tau} = \frac{1}{B-1}\bar Q_\tau^\top \bar Q_\tau + \epsilon I,
+s_q(q) = \alpha_q \tanh(f_{q,\text{res}}(q)),
+\qquad \alpha_q = \texttt{slow\_residual\_scale},
 $$
 
 $$
-C_{0\tau} = \frac{1}{B-1}\bar Q_0^\top \bar Q_\tau.
+C_q(q) = \frac{1}{\sqrt{d_h}} \operatorname{reshape}(f_{q,\text{cpl}}(q)) \in \mathbb{R}^{d_q \times d_h}.
 $$
 
-The VAMP-2 score is
+于是
 
 $$
-\mathcal{S}_{\text{VAMP-2}} = \left\| C_{00}^{-1/2} C_{0\tau} C_{\tau\tau}^{-1/2} \right\|_F^2.
+\dot q = -\,r_q(q) \odot q + s_q(q) + C_q(q) h.
 $$
 
-The training loss uses
+这可以理解为：
+
+- 一个显式稳定的线性回拉项 `-r_q(q) \odot q`
+- 一个有界残差项 `s_q(q)`
+- 一个由隐藏状态驱动的线性耦合项 `C_q(q)h`
+
+#### 4.2 隐藏变量 `h`
+
+先定义快变量速率：
 
 $$
-\mathcal{L}_{\text{VAMP}} = -\frac{1}{d_q}\mathcal{S}_{\text{VAMP-2}}.
+r_h(q) = r_{h,\min} + \operatorname{softplus}(f_{h,\text{rate}}(q)) \in \mathbb{R}^{d_h}.
 $$
 
-In code this is `_vamp2_score(...)` in `training.py`.
-
-#### 3.2 Time-lag diagonalization
-
-To encourage approximately decoupled slow coordinates, the time-lagged covariance is pushed toward diagonal form:
+再定义两个 `q` 条件化矩阵：
 
 $$
-\mathcal{L}_{\text{diag}} =
-\left\| C_{0\tau} - \mathrm{diag}(C_{0\tau}) \right\|_F^2.
-$$
-
-This is implemented by `_time_lag_covariance(...)` and `_offdiag_frobenius_loss(...)`.
-
-#### 3.3 Explicit modal Koopman decay
-
-In `soft_spectrum` mode, the modal coordinates are explicitly regularized to decay exponentially:
-
-$$
-a_{t+\tau}^{\text{pred}} = e^{-\lambda \tau} \odot a_t,
+S(q) = \frac{1}{2}\left(M(q) - M(q)^\top\right),
 $$
 
 $$
-\mathcal{L}_{\text{koopman}} =
-\mathrm{MSE}(a_{t+\tau}, a_{t+\tau}^{\text{pred}}).
+D(q) = \frac{N(q)^\top N(q)}{d_h}.
 $$
 
-This is not a full Koopman eigenfunction theory, but it is a practical spectral bias that nudges the latent basis toward ordered relaxation modes.
+其中：
 
-### 4. Mori-Zwanzig viewpoint and memory closure
+- `S(q)` 是反对称矩阵，只负责旋转 / 混合，不直接制造能量增长；
+- `D(q)` 是半正定耗散矩阵。
 
-The Mori-Zwanzig projection formalism says that after eliminating unresolved variables, the effective slow dynamics generally becomes non-Markovian:
-
-$$
-\frac{d}{dt} q(t) = R(q(t)) + \int_0^t \mathcal{K}(t-s, q(s))\, ds + F(t).
-$$
-
-Directly learning the full memory integral is difficult, so this repository uses a Markovian embedding with hidden memory states $m_t$:
+于是隐藏生成元是
 
 $$
-\frac{d}{dt} q = f_q(q, m), \qquad
-\frac{d}{dt} m = -\Lambda_m(q,m)\odot m + K_\theta(q,m).
+A_h(q) = \beta S(q) - D(q) - \operatorname{diag}(r_h(q)),
+\qquad \beta = \texttt{hidden\_operator\_scale}.
 $$
 
-Concretely, the implementation uses
+驱动项是
 
 $$
-r_q(q,m) = r_{q,\min} + \mathrm{softplus}(f_{q,\text{rate}}(q,m)),
+b_h(q) = \alpha_h \tanh(f_{h,\text{drive}}(q)),
+\qquad \alpha_h = \texttt{hidden\_drive\_scale}.
 $$
 
-$$
-r_m(q,m) = r_{m,\min} + \mathrm{softplus}(f_{m,\text{rate}}(q,m)),
-$$
+最终隐藏动力学为
 
 $$
-u_q(q,m) = \tanh(f_{q,\text{drift}}(q,m)),
+\dot h = A_h(q) h + b_h(q).
 $$
 
-$$
-\frac{d}{dt} q = r_q(q,m) \odot u_q(q,m),
-$$
+这意味着当前隐藏子系统在 `h` 上是“仿射线性”的，只对 `q` 非线性。
+
+这是当前实现和旧文案最关键的区别之一：
+
+- `h` 仍然可以解释成 closure / memory embedding。
+- 但数学上它已经不是“任意非线性 memory kernel ODE”，而是一个 `q` 条件化的仿射状态空间系统。
+
+### 5. 离散步进：`midpoint_q_plus_exact_affine_h`
+
+当前 `step(z, dt)` 的离散化非常具体，`summary.json` 里也会把它记成：
+
+```text
+integrator = midpoint_q_plus_exact_affine_h
+```
+
+#### 5.1 隐藏子系统的精确仿射步进
+
+如果把 `q` 在一步内冻结，`h` 的方程
 
 $$
-K_\theta(q,m) = 0.1 \tanh(f_{\text{kernel}}(q,m)),
+\dot h = A h + b
 $$
 
-$$
-\frac{d}{dt} m = -r_m(q,m)\odot m + K_\theta(q,m).
-$$
-
-Interpretation:
-
-- $q$ stores slow collective coordinates.
-- $m$ stores unresolved closure states.
-- $r_q$ and $r_m$ are learned positive rates.
-- $K_\theta(q,m)$ is a nonlinear closure source term.
-
-If $m$ is eliminated analytically in a linearized setting, one recovers exponentially weighted memory kernels, so this latent ODE is a finite-dimensional proxy for a generalized Langevin or Mori-Zwanzig closure.
-
-### 5. Exponential memory integrator
-
-The memory equation contains a stiff decay term $-r_m \odot m$. Instead of using a naive explicit Euler step, the implementation uses an exponential-style update:
+的精确离散解可以写成
 
 $$
-\phi_1(x) = \frac{1 - e^{-x}}{x}.
+h_{t+\Delta t} = \bar A(\Delta t)\, h_t + \bar b(\Delta t),
 $$
 
-For constant rates and forcing over one step,
+其中 `\bar A, \bar b` 来自增广矩阵指数：
 
 $$
-m_{t+\Delta t}
-= e^{-r_m \Delta t} \odot m_t
-+ \Delta t \, \phi_1(r_m \Delta t)\odot K_\theta(q,m).
-$$
-
-The code uses a midpoint-style version of this formula in `LatentRGManifoldAutoencoder.step(...)`:
-
-- $q$ is advanced with an explicit midpoint step.
-- $m$ is advanced with an exponential integrator using `phi1`.
-
-This matters because the memory block may decay faster than the slow block, and a standard explicit scheme would be much less stable.
-
-### 6. Slow manifold decoder
-
-The decoder is intentionally structured as a base slow manifold plus a memory correction:
-
-$$
-\hat x_t = g(q_t) + B(q_t) m_t.
-$$
-
-Here
-
-- $g(q_t)$ is the decoded slow-manifold state,
-- $B(q_t) \in \mathbb{R}^{d \times d_m}$ is a learned memory readout basis,
-- $B(q_t)m_t$ is the unresolved correction.
-
-In code, $g(q)$ is implemented by `manifold_decoder(q)`, and $B(q)$ is built by reshaping `memory_readout_net(q)`.
-
-So the final reconstruction is
-
-$$
-\hat x = g(q) + B(q)m.
-$$
-
-This design is important. It means the repository does not treat the decoder as a generic black box; it explicitly assumes that the observable can be decomposed into a dominant slow manifold plus a memory-dependent correction.
-
-The repository also exposes an explicit slow-manifold projection:
-
-$$
-\Pi_{\mathcal{M}}(q,m) = (q, 0),
-$$
-
-implemented by `project_to_manifold(...)`.
-
-### 7. Renormalization-group-like coarse graining
-
-The latent state can be coarse-grained with
-
-$$
-\mathcal{C}(q,m) = \left(q + \delta q, \frac{m}{s}\right),
-$$
-$$
-\delta q = \tanh(f_{\text{coarse}}(q)) \cdot \frac{\alpha}{s},
-$$
-
-where
-
-- $s =$ `rg_scale`,
-- $\alpha =$ `coarse_strength`.
-
-The RG consistency penalty enforces that coarse graining and time evolution approximately commute:
-
-$$
-\mathcal{C}\left(\Phi_{\Delta t}^{(h)}(z_t)\right)
-\approx
-\Phi_{s\Delta t}^{(h)}\left(\mathcal{C}(z_t)\right).
-$$
-
-The corresponding loss is
-
-$$
-\mathcal{L}_{\text{RG}}
+\exp\!\left(
+\begin{bmatrix}
+\Delta t\, A & \Delta t\, b \\
+0 & 0
+\end{bmatrix}
+\right)
 =
-\mathrm{MSE}\left(
-\mathcal{C}(\Phi_{\Delta t}^{(h)}(z_t)),
-\Phi_{s\Delta t}^{(h)}(\mathcal{C}(z_t))
-\right).
+\begin{bmatrix}
+\bar A(\Delta t) & \bar b(\Delta t) \\
+0 & 1
+\end{bmatrix}.
 $$
 
-This is implemented in `_loss_bundle(...)` through `coarse_after_fine` and `fine_after_coarse`.
+代码里的 `_affine_hidden_transition(...)` 和 `hidden_ssm_matrices(...)` 就是在做这件事。
 
-Conceptually, this says that the latent dynamics should define a reasonable effective theory at a coarser scale, not just a one-off predictive latent code.
+#### 5.2 整体一步的真实更新公式
 
-### 8. Multi-horizon rollout consistency
-
-For horizons $h \in \mathcal{H}$, the model rolls out
+设
 
 $$
-\hat z_{t+h} = \Phi^{(h)}(z_t).
+f_q(q,h) = -\,r_q(q) \odot q + s_q(q) + C_q(q)h.
 $$
 
-Those predictions are compared to latent encodings of future windows:
+代码中的一步更新是：
+
+1. 先做 `q` 的 midpoint predictor
+
+   $$
+   q_{t+\frac{1}{2}} = q_t + \frac{\Delta t}{2} f_q(q_t, h_t).
+   $$
+
+2. 用冻结在 `q_t` 的隐藏算子做半步精确更新
+
+   $$
+   h_{t+\frac{1}{2}} = \bar A(q_t, \tfrac{\Delta t}{2})\, h_t + \bar b(q_t, \tfrac{\Delta t}{2}).
+   $$
+
+3. 用中点状态评估 `q` 的 drift，并完成整步
+
+   $$
+   q_{t+\Delta t} = q_t + \Delta t\, f_q(q_{t+\frac{1}{2}}, h_{t+\frac{1}{2}}).
+   $$
+
+4. 再用冻结在 `q_{t+\frac{1}{2}}` 的隐藏算子，从原始 `h_t` 直接做一整步精确更新
+
+   $$
+   h_{t+\Delta t} = \bar A(q_{t+\frac{1}{2}}, \Delta t)\, h_t + \bar b(q_{t+\frac{1}{2}}, \Delta t).
+   $$
+
+注意最后一步不是从 `h_{t+\frac{1}{2}}` 再推进，而是重新从 `h_t` 出发、用中点冻结算子做整步。这正是代码现在的实现。
+
+### 6. 结构化解码器与慢流形投影
+
+解码器不是黑箱 MLP，而是显式写成
 
 $$
-z_{t+h}^{\text{enc}} = E_\theta(W_{t+h}).
+\hat x_t = g(q_t) + B(q_t) h_t.
 $$
 
-The repository uses several consistency losses:
-
-#### 8.1 Observation prediction
+其中：
 
 $$
-\mathcal{L}_{\text{pred}}
-= \frac{1}{|\mathcal{H}|}\sum_{h \in \mathcal{H}}
-\mathrm{MSE}\left(D(\hat z_{t+h}), x_{t+h}\right).
+g(q_t) = \texttt{manifold\_decoder}(q_t),
 $$
 
-#### 8.2 Latent alignment
-
 $$
-\mathcal{L}_{\text{latent-align}}
-= \frac{1}{|\mathcal{H}|}\sum_{h \in \mathcal{H}}
-\mathrm{MSE}\left(\hat z_{t+h}, z_{t+h}^{\text{enc}}\right).
+B(q_t) = \operatorname{reshape}(\texttt{hidden\_readout\_net}(q_t)) \in \mathbb{R}^{d \times d_h}.
 $$
 
-#### 8.3 Slow-coordinate alignment
+所以观测重构被拆成：
+
+- `g(q)`：慢流形主项
+- `B(q)h`：离流形修正 / 快变量修正
+
+模型还暴露了一个显式慢流形投影：
 
 $$
-\mathcal{L}_{q\text{-align}}
-= \frac{1}{|\mathcal{H}|}\sum_{h \in \mathcal{H}}
-\mathrm{MSE}\left(\hat q_{t+h}, q_{t+h}^{\text{enc}}\right).
+\Pi_{\mathcal M}(q,h) = (q, 0),
 $$
 
-This is named `vamp_align_loss` in the training code.
+对应 `project_to_manifold(...)`。
 
-#### 8.4 Semigroup consistency
+### 7. RG-like coarse graining
 
-For any $h_1, h_2, h_1+h_2 \in \mathcal{H}$,
+当前 coarse graining 作用在 latent 上：
 
 $$
-\Phi^{(h_2)}(z_{t+h_1}^{\text{enc}})
+\mathcal C(q,h)
+=
+\left(
+q + \delta q(q),\ \frac{h}{s}
+\right),
+$$
+
+其中
+
+$$
+\delta q(q) = \tanh(f_{\text{coarse}}(q)) \cdot \frac{\alpha_{\text{cg}}}{s},
+$$
+
+$$
+s = \texttt{rg\_scale},
+\qquad
+\alpha_{\text{cg}} = \texttt{coarse\_strength}.
+$$
+
+这不是 Wilsonian RG，只是一个在 latent 上检查 coarse/fine 动力学是否大致交换的先验。
+
+## 每个性质是怎么被约束的
+
+下面这部分只写当前 `training.py` 里实际算出来的损失。
+
+记 horizon 集合为 `\mathcal H`，其中主 horizon 是排序后的第一个：
+
+$$
+h_* = \min \mathcal H.
+$$
+
+一些谱相关损失只用 `h_*`，而多步一致性损失用所有 horizon。
+
+### 1. 重构：让 `(q,h)` 真正解释当前观测
+
+$$
+\mathcal L_{\text{rec}} = \operatorname{MSE}(D(z_t), x_t).
+$$
+
+这里 `D` 就是上面的结构化解码器。
+
+### 2. VAMP-2：让 `q` 成为慢特征
+
+取当前窗口和主 horizon 未来窗口的 slow code：
+
+$$
+Q_0 = q_t,
+\qquad
+Q_1 = q_{t+h_*}^{\text{enc}}.
+$$
+
+先做 batch 内中心化，得到
+
+$$
+\bar Q_0,\ \bar Q_1.
+$$
+
+再定义
+
+$$
+C_{00} = \frac{1}{B-1}\bar Q_0^\top \bar Q_0 + \varepsilon I,
+$$
+
+$$
+C_{11} = \frac{1}{B-1}\bar Q_1^\top \bar Q_1 + \varepsilon I,
+$$
+
+$$
+C_{01} = \frac{1}{B-1}\bar Q_0^\top \bar Q_1.
+$$
+
+VAMP-2 score 是
+
+$$
+\mathcal S_{\text{VAMP2}}
+=
+\left\|
+C_{00}^{-1/2} C_{01} C_{11}^{-1/2}
+\right\|_F^2.
+$$
+
+训练里最小化的是
+
+$$
+\mathcal L_{\text{vamp}}
+=
+-\frac{1}{d_q}\mathcal S_{\text{VAMP2}}.
+$$
+
+### 3. 时间滞后对角化：让 `q` 尽量解耦
+
+仍然使用主 horizon 的 time-lag covariance：
+
+$$
+C_{01} = \frac{1}{B-1}\bar Q_0^\top \bar Q_1 + \varepsilon I.
+$$
+
+代码里真正优化的是 off-diagonal Frobenius 范数：
+
+$$
+\mathcal L_{\text{diag}}
+=
+\left\|
+C_{01} - \operatorname{diag}(C_{01})
+\right\|_F^2.
+$$
+
+### 4. Koopman modal decay：只约束 encoder 侧 modal basis
+
+如果 `latent_scheme = soft_spectrum`，当前和主 horizon 未来的 modal feature 分别是
+
+$$
+a_t,\qquad a_{t+h_*}.
+$$
+
+给定 `modal_rates = \lambda`，代码构造指数衰减预测：
+
+$$
+\hat a_{t+h_*} = e^{-\lambda\, h_* \Delta t} \odot a_t.
+$$
+
+损失是
+
+$$
+\mathcal L_{\text{koop}}
+=
+\operatorname{MSE}(a_{t+h_*}, \hat a_{t+h_*}).
+$$
+
+如果 `hard_split`，这一项自动为零。
+
+### 5. 多步 rollout 预测：让 latent dynamics 能解码成未来观测
+
+从当前 latent `z_t` 出发做 rollout：
+
+$$
+\hat z_{t+h} = \Phi_h(z_t), \qquad h \in \mathcal H.
+$$
+
+未来观测预测损失是
+
+$$
+\mathcal L_{\text{pred}}
+=
+\frac{1}{|\mathcal H|}
+\sum_{h \in \mathcal H}
+\operatorname{MSE}(D(\hat z_{t+h}), x_{t+h}).
+$$
+
+### 6. `q` 对齐：让 rollout 的慢变量和重新编码的慢变量一致
+
+这是代码里名叫 `vamp_align_loss` 的项，但实际含义是 `q`-alignment：
+
+$$
+\mathcal L_{q\text{-align}}
+=
+\frac{1}{|\mathcal H|}
+\sum_{h \in \mathcal H}
+\operatorname{MSE}(\hat q_{t+h}, q_{t+h}^{\text{enc}}).
+$$
+
+这里
+
+$$
+\hat q_{t+h} = \text{split}_q(\hat z_{t+h}).
+$$
+
+### 7. latent 对齐：让 rollout 的整个 `z` 和重新编码的 `z` 一致
+
+$$
+\mathcal L_{\text{latent-align}}
+=
+\frac{1}{|\mathcal H|}
+\sum_{h \in \mathcal H}
+\operatorname{MSE}(\hat z_{t+h}, z_{t+h}^{\text{enc}}).
+$$
+
+### 8. 半群一致性：让 latent dynamics 更像真正的流
+
+代码对所有满足 `h_1 + h_2 \in \mathcal H` 的组合做：
+
+$$
+\Phi_{h_2}(z_{t+h_1}^{\text{enc}})
 \approx
 z_{t+h_1+h_2}^{\text{enc}}.
 $$
 
-So the semigroup penalty is
+对应损失：
 
 $$
-\mathcal{L}_{\text{semigroup}}
+\mathcal L_{\text{semigroup}}
 =
-\mathrm{mean}_{h_1,h_2}
-\mathrm{MSE}\left(
-\Phi^{(h_2)}(z_{t+h_1}^{\text{enc}}),
+\operatorname{mean}_{h_1,h_2}
+\operatorname{MSE}\!\left(
+\Phi_{h_2}(z_{t+h_1}^{\text{enc}}),
 z_{t+h_1+h_2}^{\text{enc}}
 \right).
 $$
 
-This encourages a genuinely dynamical latent representation rather than an arbitrary autoencoding coordinate system.
+注意它不是从 `z_t` 的 rollout 再拆分，而是直接拿未来窗口重新编码出来的 latent 做半群检查。
 
-### 9. Time-scale separation and contraction
+### 9. 时间尺度分离：让 `h` 比 `q` 快
 
-The implementation explicitly encourages the memory block to relax faster than the slow block. Let
+从当前 batch 的动力学统计量里取：
 
 $$
-\bar r_q = \mathrm{mean}(r_q),
+\bar r_q = \operatorname{mean}(r_q(q_t)),
 \qquad
-\bar r_m = \mathrm{mean}(r_m).
+\bar r_h = \operatorname{mean}(r_h(q_t)).
 $$
 
-The separation gap is
+定义 gap：
 
 $$
-\Delta_{\text{sep}} = \bar r_m - \bar r_q.
+\Delta_{\text{sep}} = \bar r_h - \bar r_q.
 $$
 
-The loss is
+代码里的损失是
 
 $$
-\mathcal{L}_{\text{sep}} =
-\mathrm{ReLU}(\gamma_{\text{sep}} - \Delta_{\text{sep}}),
-$$
-
-where `separation_margin` is $\gamma_{\text{sep}}$.
-
-There is also a contraction-style condition on the memory dynamics. Write
-
-$$
-J_m(q,m) = \frac{\partial K_\theta(q,m)}{\partial m},
-$$
-
-and let
-
-$$
-J_m^{\text{sym}} = \frac{1}{2}(J_m + J_m^\top).
-$$
-
-The code penalizes violations of
-
-$$
-\lambda_{\max}(J_m^{\text{sym}})
-\le
-\min_i r_{m,i} - \gamma_{\text{contract}},
-$$
-
-which is a sufficient local condition pushing the memory subsystem toward contraction after accounting for its decay term.
-
-### 10. Metric preservation
-
-The metric loss encourages the slow coordinates to preserve neighborhood geometry of the windowed input:
-
-$$
-\mathcal{L}_{\text{metric}}
+\mathcal L_{\text{sep}}
 =
-\mathrm{MSE}\left(
-\widetilde D(W_i, W_j),
-\widetilde D(q_i, q_j)
+\operatorname{ReLU}(\gamma_{\text{sep}} - \Delta_{\text{sep}}),
+$$
+
+其中 `\gamma_{\text{sep}} = separation_margin`。
+
+### 10. 隐藏子系统收缩裕量：检查对称部谱界
+
+对隐藏生成元
+
+$$
+A_h(q),
+$$
+
+取其对称部分
+
+$$
+A_h^{\text{sym}}(q)
+=
+\frac{1}{2}\left(A_h(q) + A_h(q)^\top\right).
+$$
+
+定义最大特征值上界
+
+$$
+\lambda_{\max}^{\text{sym}}(q)
+=
+\lambda_{\max}(A_h^{\text{sym}}(q)).
+$$
+
+代码中直接最小化
+
+$$
+\mathcal L_{\text{contract}}
+=
+\operatorname{ReLU}\!\left(
+\lambda_{\max}^{\text{sym}}(q) + \gamma_{\text{contract}}
 \right),
 $$
 
-where $\widetilde D$ is the pairwise distance matrix normalized by its mean.
+其中 `\gamma_{\text{contract}} = contraction_margin`。
 
-This helps prevent the learned slow coordinates from becoming spectrally good but geometrically degenerate.
+这里有个实现层面的重点：
 
-### 11. Full training objective
+- 由于 `A_h(q)` 的参数化本身就是“反对称 + 负半定耗散 + 负对角速率”，稳定性已经被硬编码进结构里。
+- `contract_loss` 更像是一个额外的谱裕量检查，而不是唯一的稳定性来源。
 
-The total loss is the weighted sum
+### 11. RG-like 一致性：让 coarse graining 和推进近似交换
+
+只在 `rg_weight > 0` 且课程训练进入 phase 3 时启用。
+
+代码比较的是：
 
 $$
-\mathcal{L}
+\mathcal C(\Phi_r(z_t))
+\quad\text{vs}\quad
+\Phi_r^{(s\Delta t)}(\mathcal C(z_t)),
+$$
+
+其中：
+
+- `r = rg_horizon`
+- 右边用的是更大的步长 `s \Delta t`
+- 两边 step 数都还是 `r`
+
+所以损失写成
+
+$$
+\mathcal L_{\text{rg}}
 =
-\lambda_{\text{rec}}\mathcal{L}_{\text{rec}}
-+ \lambda_{\text{vamp}}\mathcal{L}_{\text{VAMP}}
-+ \lambda_{q\text{-align}}\mathcal{L}_{q\text{-align}}
-+ \lambda_{\text{koop}}\mathcal{L}_{\text{koopman}}
-+ \lambda_{\text{diag}}\mathcal{L}_{\text{diag}}
-+ \lambda_{\text{pred}}\mathcal{L}_{\text{pred}}
-+ \lambda_{\text{latent}}\mathcal{L}_{\text{latent-align}}
-+ \lambda_{\text{sg}}\mathcal{L}_{\text{semigroup}}
-+ \lambda_{\text{contract}}\mathcal{L}_{\text{contract}}
-+ \lambda_{\text{sep}}\mathcal{L}_{\text{sep}}
-+ \lambda_{\text{RG}}\mathcal{L}_{\text{RG}}
-+ \lambda_{\text{metric}}\mathcal{L}_{\text{metric}}
-+ \lambda_{\ell_1}\|m\|_1
-+ \mathcal{L}_{\text{sup}}.
+\operatorname{MSE}\!\left(
+\mathcal C(\Phi_r^{(\Delta t)}(z_t)),
+\Phi_r^{(s\Delta t)}(\mathcal C(z_t))
+\right).
 $$
 
-Default weights are defined in `LossConfig`:
+### 12. 几何保持：让 `q` 不是纯谱上好看、几何上塌缩
+
+代码对 batch 内 pairwise distance 做均值归一化：
+
+$$
+\widetilde D(X) = \frac{D(X)}{\operatorname{mean}(D(X)) + 10^{-6}}.
+$$
+
+其中输入端用的是展平窗口 `\operatorname{vec}(W_t)`，latent 端用的是 `q_t`。
+
+于是
+
+$$
+\mathcal L_{\text{metric}}
+=
+\operatorname{MSE}\!\left(
+\widetilde D(\operatorname{vec}(W_i), \operatorname{vec}(W_j)),
+\widetilde D(q_i, q_j)
+\right).
+$$
+
+为了节约计算，batch 太大时会随机 subsample 到 `metric_subsample` 个样本。
+
+### 13. 隐藏幅值稀疏化：不要让 `h` 无限制膨胀
+
+代码使用的是简单的 `L1` 惩罚：
+
+$$
+\mathcal L_{|h|} = \|h_t\|_1^{\text{mean}}.
+$$
+
+在配置和日志里它有时叫 `hidden_l1_loss`，有时叫 `memory_l1_loss`，本质上都是同一项。
+
+### 14. 可选监督：`q` / `h` 对标签分量做对齐
+
+如果传入标签并给正权重，会计算：
+
+$$
+\mathcal L_{\text{sup}}
+=
+w_q \mathcal L_{\text{sup},q}
++
+w_h \mathcal L_{\text{sup},h}.
+$$
+
+其中：
+
+- `q` 监督既比较当前步，也比较所有 future horizon。
+- `h` 监督也比较当前步和 future horizon。
+- `q_mode = direct` 时用普通 MSE。
+- `q_mode = angular` 时用 wrap 后的角距离平方：
+
+  $$
+  \delta(\hat y, y) = \operatorname{atan2}(\sin(\hat y-y), \cos(\hat y-y)),
+  \qquad
+  \ell = \delta^2.
+  $$
+
+还有一个实现细节很关键：
+
+- 当 `q_mode = angular` 时，监督的不是 whitened `q`，而是 `q_raw`。
+- 也就是角度监督发生在 VAMP whitening 之前，避免 whitening 把角变量几何关系扭曲掉。
+
+### 15. 总目标
+
+当前代码的总损失是
+
+$$
+\mathcal L
+=
+\lambda_{\text{rec}}\mathcal L_{\text{rec}}
++
+\lambda_{\text{vamp}}\mathcal L_{\text{vamp}}
++
+\lambda_{q\text{-align}}\mathcal L_{q\text{-align}}
++
+s_{\text{koop}}(p)\lambda_{\text{koop}}\mathcal L_{\text{koop}}
++
+s_{\text{diag}}(p)\lambda_{\text{diag}}\mathcal L_{\text{diag}}
++
+s_{\text{pred}}(p)\lambda_{\text{pred}}\mathcal L_{\text{pred}}
++
+s_{\text{latent}}(p)\lambda_{\text{latent}}\mathcal L_{\text{latent-align}}
++
+s_{\text{sg}}(p)\lambda_{\text{sg}}\mathcal L_{\text{semigroup}}
++
+s_{\text{contract}}(p)\lambda_{\text{contract}}\mathcal L_{\text{contract}}
++
+s_{\text{sep}}(p)\lambda_{\text{sep}}\mathcal L_{\text{sep}}
++
+s_{\text{rg}}(p)\lambda_{\text{rg}}\mathcal L_{\text{rg}}
++
+\lambda_{\text{metric}}\mathcal L_{\text{metric}}
++
+\lambda_{|h|}\mathcal L_{|h|}
++
+\mathcal L_{\text{sup}}.
+$$
+
+这里 `p` 表示 curriculum phase。
+
+默认权重来自 `LossConfig`：
 
 ```python
 LossConfig(
@@ -647,139 +945,296 @@ LossConfig(
     contract_weight=0.2,
     rg_weight=0.05,
     metric_weight=0.1,
-    memory_l1_weight=1e-4,
+    hidden_l1_weight=1e-4,
+    separation_margin=0.5,
+    contraction_margin=0.10,
 )
 ```
 
-### 12. Curriculum training
+## 课程训练与 phase 行为
 
-Training is staged in three phases:
+当前训练分三阶段：
 
-1. Phase 1: spectral organization. Koopman/diagonalization terms are active while the dynamical subnetworks are frozen.
-2. Phase 2: predictive dynamics. Prediction, latent alignment, contraction, and time-scale separation are activated.
-3. Phase 3: full multiscale consistency. Semigroup and RG penalties are activated and the learning rate is reduced.
+### Phase 1
 
-The default schedule is controlled by:
+- dynamics 模块冻结
+- 开启 `koopman`、`diag`
+- 关闭 `prediction`、`latent_align`、`semigroup`、`contract`、`separation`、`rg`
+- `reconstruction`、`vamp`、`q-align(vamp_align)`、`metric`、`hidden_l1`、监督项仍然存在
 
-- `phase1_fraction`
-- `phase2_fraction`
-- `phase3_lr_scale`
+### Phase 2
 
-Preset options in the CLI:
+- dynamics 模块解冻
+- 开启 `prediction`、`latent_align`、`contract`、`separation`
+- `semigroup` 和 `rg` 仍关闭
 
-- `legacy`
-- `conservative`
-- `alanine_bootstrap`
+### Phase 3
 
-## Synthetic benchmarks
+- 开启全部项
+- 学习率按 `phase3_lr_scale` 缩放
 
-The repository includes three built-in synthetic generators.
+CLI 里可以用：
+
+- `--curriculum_preset legacy`
+- `--curriculum_preset conservative`
+- `--curriculum_preset alanine_bootstrap`
+
+也可以手动覆盖 `epochs`、`phase1_fraction`、`phase2_fraction`、`phase3_lr_scale`。
+
+## 为了稳定性和效率做的合理简化
+
+这一节专门解释“代码现在为什么这样写”。
+
+### 1. 用 `q,h` 而不是旧的 `q,m` 理论叙事
+
+当前实现里，`h` 更准确的说法是：
+
+- hidden fast state
+- closure state
+- memory embedding
+
+它当然仍然能承担 Mori-Zwanzig 风格的“有限维记忆嵌入”角色，但代码已经不再直接实现“通用 nonlinear memory ODE + kernel source term”那套更宽泛的文案。
+
+### 2. 把隐藏动力学限制成 `q` 条件化的仿射状态空间
+
+这是当前实现最重要的结构简化：
+
+$$
+\dot h = A_h(q)h + b_h(q),
+$$
+
+而不是更一般的
+
+$$
+\dot h = F(q,h).
+$$
+
+这么做的好处是：
+
+- 可以直接用矩阵指数得到稳定的一步离散化
+- 能把耗散、旋转、正速率分开参数化
+- 为后续 selective scan / SSD 风格内核预留统一接口
+
+代价是：
+
+- `h` 的非线性只来自 `q` 条件化，不直接来自 `h` 自身的更高阶非线性
+- 表达能力比“任意非线性快变量方程”更受限
+
+### 3. 稳定性大部分来自结构参数化，不是靠罚项硬拉
+
+当前 `A_h(q)` 的结构
+
+$$
+\beta S(q) - D(q) - \operatorname{diag}(r_h(q))
+$$
+
+本身就把“反对称混合 + 耗散 + 正衰减率”编码进去了。
+
+这比只写一个任意矩阵然后靠 spectral penalty 去补救更稳定，也更容易解释。
+
+### 4. `q` 用 midpoint，`h` 用 exact affine step
+
+这不是为了好看，而是因为：
+
+- `q` 是非线性、低维、需要中点信息
+- `h` 是条件仿射线性，完全可以利用精确离散化
+
+所以现在的 integrator 是一个混合方案，而不是统一用 Euler 或黑盒 ODE solver。
+
+### 5. VAMP whitening 统计量不参与反向传播
+
+`RunningWhitenedVAMP` 里的均值、协方差和 whitening 矩阵在使用时都被 `detach` 了。
+
+这样做会牺牲一部分“端到端严格性”，但训练会明显更稳，也避免协方差逆平方根把梯度图搞得很重。
+
+### 6. 谱损失只盯主 horizon
+
+`VAMP`、`diag`、`koopman modal decay` 都只用排序后最小的 horizon `h_*`。
+
+这是一个明确的效率/稳定性折中：
+
+- 优点：目标更稳定，梯度更集中，训练开销更低
+- 缺点：长时谱性质主要靠 rollout / semigroup / prediction 间接约束，而不是每个 horizon 都直接加谱损失
+
+### 7. RG-like coarse graining 只发生在 latent 上
+
+当前 coarse graining 只改 `q` 和 `h`：
+
+- `q` 加一个小的 learned correction
+- `h` 除以 `rg_scale`
+
+它没有去 coarse-grain encoder、decoder 或原始观测空间，所以它是一个实用的 latent consistency prior，不是完整的多层级 RG 框架。
+
+### 8. 兼容别名还在，但语义已经迁移
+
+代码里还保留了：
+
+- `--m_dim` 作为 `--h_dim` 的别名
+- `min_memory_rate` 作为 `min_fast_rate` 的别名
+- `m_indices` / `m_weight` 作为 `h_indices` / `h_weight` 的别名
+- 导出的 `memory_*` 指标
+
+这是为了兼容旧脚本，不代表模型内部仍然以旧 `m` 叙事为核心。
+
+## 为什么说它是 SSD-ready，但还不是完整 Mamba kernel
+
+这里的 “SSD-ready” 不是营销词，而是指当前隐藏子系统已经具备被改写成 selective state-space / scan 风格实现的数学接口。
+
+### 1. 为什么说它已经 SSD-ready
+
+对给定的 `q` 轨迹，隐藏状态一步更新已经可以写成
+
+$$
+h_{k+1} = \bar A_k h_k + \bar b_k,
+$$
+
+其中
+
+$$
+\bar A_k = \bar A(q_{k+\frac12}, \Delta t),
+\qquad
+\bar b_k = \bar b(q_{k+\frac12}, \Delta t).
+$$
+
+代码里 `hidden_ssm_matrices(q, dt)` 已经直接返回：
+
+- `generator`
+- `transition`
+- `bias`
+- `fast_rates`
+
+也就是说，隐藏子系统已经被整理成了“每步给出状态转移矩阵和偏置”的形式。
+
+从这个角度看，它已经满足：
+
+1. 有显式状态矩阵 `A`
+2. 有显式离散转移 `\bar A`
+3. 有显式输入/驱动偏置 `\bar b`
+4. hidden recurrence 和 decoder 是解耦接口
+
+这就是后续接 scan kernel、chunked recurrence、SSD-style dual view 的基础。
+
+### 2. 为什么它还不是完整 Mamba kernel
+
+当前实现距离完整 Mamba / fused selective scan 还有明确差距：
+
+1. 整个 latent 更新不是纯线性 scan  
+   `q` 的更新依赖非线性 midpoint drift，而且 `q` 和 `h` 双向耦合，所以整套 `z=(q,h)` 还不能直接视为一个单一线性递推核。
+
+2. 当前每步都在做 dense matrix exponential  
+   `hidden_ssm_matrices` 通过 `torch.matrix_exp` 计算增广矩阵指数。这在数学上很干净，但不是 Mamba 那种专门为长序列做的结构化、融合化 kernel。
+
+3. 没有 fused CUDA / Triton selective scan  
+   现在的 rollout 是 Python/PyTorch 循环里的逐步 `model.step(...)`，没有并行 prefix scan、没有 chunked backward kernel、也没有专用 GPU fused 实现。
+
+4. 没有 Mamba 风格的完整输入输出投影接口  
+   当前模型有窗口 encoder 和结构化 decoder，但没有 Mamba 那种围绕 token stream、causal conv、input-dependent parameter generation 搭起来的整套 block。
+
+5. `A_t` 的选择性来自 `q_t`，不是直接来自每个 token 的投影参数流  
+   这更像“非线性慢变量驱动的条件 SSM”，而不是标准 Mamba block 里的 selective parameterization。
+
+6. 训练范式还是“窗口编码 + rollout 对齐”  
+   不是直接对整段序列做高吞吐流式 selective scan。
+
+所以更准确的说法应该是：
+
+> 当前仓库已经把 `h` 子系统整理成了可离散、可导出、可替换成 scan 内核的仿射 SSM 形式，因此是 SSD-ready；但由于 `q` 的非线性 midpoint 更新、`q/h` 耦合、dense matrix exponential 和缺失 fused scan kernel，它还不是完整的 Mamba kernel。
+
+## 重要 CLI 选项
+
+最常用的参数：
+
+- `--window`：窗口长度 `L`
+- `--q_dim`：慢变量维度
+- `--h_dim`：隐藏快变量维度
+- `--m_dim`：`--h_dim` 的兼容别名
+- `--latent_scheme {hard_split,soft_spectrum}`
+- `--modal_dim`
+- `--modal_temperature`
+- `--encoder_type {temporal_conv,mlp}`
+- `--encoder_levels`
+- `--encoder_kernel_size`
+- `--horizons`
+- `--dt`
+- `--curriculum_preset`
+- `--q_label_indices`
+- `--h_label_indices`
+- `--m_label_indices`：`--h_label_indices` 的兼容别名
+- `--q_supervised_weight`
+- `--h_supervised_weight`
+- `--m_supervised_weight`：`--h_supervised_weight` 的兼容别名
+- `--q_supervision_mode {direct,angular}`
+- `--eval_batch_size`
+
+当前 CLI 还有两个边界需要写清楚：
+
+1. `--contract_batch` 目前会被解析并记录进 `TrainConfig`，但训练代码没有实际使用它。
+2. `ModelConfig` 里的 `min_slow_rate`、`min_fast_rate`、`hidden_operator_scale`、`hidden_drive_scale`、`slow_residual_scale`、以及 `LossConfig` 里的 `separation_margin` / `contraction_margin` 目前没有 CLI 开关，仍使用代码默认值。
+
+## 合成基准的真实内容
 
 ### `toy`
 
-A low-dimensional hidden nonlinear system with a clear slow-fast gap. This is a good sanity check for whether $q$ and $m$ separate correctly.
+隐藏真值是四维：
+
+$$
+(q_1, q_2, a, m),
+$$
+
+其中有明显慢快分离；导出的 `synthetic_hidden_state.csv` 和 `synthetic_labels.csv` 都是这四个量。
 
 ### `no_gap_toy`
 
-A similar system but without strong scale separation. This is useful to test whether the model invents false slow coordinates or memory structure when the spectrum is not cleanly separated.
+也是四维隐藏系统，但慢快 gap 被显著削弱，用来检查模型是否会在没有清晰谱分离时过拟合出虚假的慢变量结构。
 
 ### `alanine_like`
 
-A toy molecular-dynamics-inspired benchmark with:
+隐藏真值是：
 
-- angular slow coordinates $(\phi, \psi)$,
-- multiple metastable basins,
-- additional fast hidden modes,
-- a closure variable coupled to basin occupancy and fast coordinates.
+- 两个角变量 `(\phi,\psi)`
+- `alanine_fast_dim` 个快变量
+- 一个 closure-like hidden scalar
 
-This benchmark is especially relevant for studying whether the latent $q$ coordinates align with metastable conformational dynamics.
+实现里：
 
-## Code-level concept map
+- 监督标签 `labels` 是 `[\phi,\psi,\text{fast}_1,\dots]`
+- probe 标签 `probe_labels` 是 `[sin\phi, cos\phi, sin\psi, cos\psi, \text{fast}_1,\dots]`
+- closure scalar 只在 `hidden_state` 里，不在默认监督标签里
 
-| Concept | Main implementation |
+## 当前局限
+
+- 没有打包元数据和正式安装入口。
+- hidden recurrence 虽然已经是 affine SSM，但仍用 dense `matrix_exp`，不适合长序列高吞吐训练。
+- `q` 分支仍是非线性 midpoint 更新，无法直接并入一个单核 selective scan。
+- RG-like 项只是 latent consistency prior，不是完整 RG 理论实现。
+- phase 训练里有些项一直开启、有些项按 phase gate；这是一套工程上好用的课程策略，不是严格从理论推导出来的唯一方案。
+- `contract_batch` 目前未被使用。
+
+## 代码级对照表
+
+| 概念 | 真实实现位置 |
 | --- | --- |
-| Temporal multiscale encoder | `TemporalMultiscaleEncoder` in `model.py` |
-| Soft spectral partition | `modal_rates`, `modal_weight_vectors`, `encode_components` |
-| Running VAMP whitening | `RunningWhitenedVAMP` |
-| Slow / memory latent split | `split_latent`, `join_latent` |
-| Memory kernel closure | `memory_kernel` |
-| Slow-memory latent ODE | `derivative`, `step`, `flow` |
-| Slow manifold projection | `project_to_manifold` |
-| RG coarse graining | `coarse_grain` |
-| VAMP-2 score | `_vamp2_score` in `training.py` |
-| Koopman modal decay | `_koopman_consistency_loss` |
-| Time-lag diagonalization | `_time_lag_covariance`, `_offdiag_frobenius_loss` |
-| Latent rollout / semigroup | `_rollout_cache`, `_semigroup_loss` |
-| Contraction regularization | `_contract_loss` |
-| Curriculum schedule | `_phase_scales`, `_curriculum_phase` |
+| 窗口编码 | `TemporalMultiscaleEncoder` / `encoder_backbone` |
+| soft spectral split | `modal_rates`、`modal_weight_vectors`、`encode_components` |
+| VAMP whitening | `RunningWhitenedVAMP` |
+| `q/h` latent state | `split_latent`、`join_latent` |
+| 慢变量动力学 | `latent_statistics` 中的 `dq` |
+| 隐藏仿射 SSM | `_hidden_operator`、`hidden_ssm_matrices`、`_affine_hidden_transition` |
+| 混合积分器 | `step` |
+| 结构化解码器 | `decode_parts` |
+| 慢流形投影 | `project_to_manifold` |
+| latent coarse graining | `coarse_grain` |
+| VAMP-2 | `_vamp2_score` |
+| modal Koopman loss | `_koopman_consistency_loss` |
+| 多步 rollout | `_rollout_cache` |
+| `q` 对齐 | `_q_align_loss` |
+| latent 对齐 | `_latent_align_loss` |
+| 半群一致性 | `_semigroup_loss` |
+| 收缩裕量 | `_memory_contract_loss` |
+| 总损失拼装 | `_loss_bundle` |
 
-## Important CLI options
+## 结论
 
-Model and representation:
+如果只用一句话描述当前代码，请以这句为准：
 
-- `--window`: context length $L$.
-- `--q_dim`: slow latent dimension.
-- `--m_dim`: memory latent dimension.
-- `--latent_scheme`: `hard_split` or `soft_spectrum`.
-- `--modal_dim`: number of shared spectral modes in `soft_spectrum`.
-- `--modal_temperature`: softness of slow-vs-memory partition.
-- `--encoder_type`: `temporal_conv` or `mlp`.
-- `--rg_scale`: coarse-graining scale factor.
-- `--coarse_strength`: amplitude of the learned coarse correction.
-
-Training:
-
-- `--horizons`: rollout horizons used for prediction and consistency.
-- `--curriculum_preset`: curriculum schedule preset.
-- `--vamp_weight`, `--koopman_weight`, `--rg_weight`, etc.: loss weights.
-- `--contract_batch`: subsample size used by contraction regularization.
-- `--eval_batch_size`: batch size for latent probing.
-
-Supervision:
-
-- `--label_path`: optional aligned labels.
-- `--q_label_indices`: which label channels supervise $q$.
-- `--m_label_indices`: which label channels supervise $m$.
-- `--q_supervised_weight`, `--m_supervised_weight`: supervision strengths.
-- `--q_supervision_mode angular`: useful for angular labels such as torsion angles.
-
-## Interpreting the learned latent state
-
-The intended interpretation is:
-
-- $q$: slowly decorrelating, approximately Koopman-aligned coordinates.
-- $m$: unresolved transient memory needed for accurate short- and medium-horizon prediction.
-- $g(q)$: slow-manifold reconstruction.
-- $B(q)m$: off-manifold correction generated by unresolved fast structure.
-
-In practice, a good model should show:
-
-- larger learned memory rates than slow rates,
-- low diagonalization loss,
-- low Koopman modal decay loss,
-- decent multi-horizon prediction accuracy,
-- improvement in probe $R^2$ when using $z=(q,m)$ compared with $q$ alone for fast targets.
-
-## Current limitations
-
-- There is no packaging metadata yet (`pyproject.toml`, wheels, console scripts).
-- The model uses heuristic neural regularizers rather than a formal proof of Koopman invariance or exact Mori-Zwanzig closure.
-- The RG loss is an effective coarse-graining consistency prior, not a full Wilsonian renormalization procedure.
-- The decoder assumes the memory correction is linear in $m$ once conditioned on $q$.
-- The latent ODE is continuous-time in form but trained from discrete windows and finite rollout horizons.
-
-## Suggested next steps
-
-If you want to extend the repository, the most natural additions are:
-
-1. Add plotting notebooks for latent spectra, implied timescales, and basin occupancy.
-2. Add a `pyproject.toml` with pinned dependencies and console entrypoints.
-3. Add benchmark scripts for real molecular dynamics or climate datasets.
-4. Add ablations comparing `hard_split` vs `soft_spectrum`.
-5. Add diagnostics for memory-kernel Jacobian eigenvalues and RG commutator error over time.
-
-## Citation-style summary
-
-If you need a one-paragraph description of the method:
-
-> Neural Dynamic System learns a latent decomposition $z=(q,m)$ from trajectory windows, where $q$ captures slow Koopman-like coordinates and $m$ captures unresolved memory states. The model uses VAMP whitening and time-lag spectral regularization for slow-mode discovery, a Mori-Zwanzig-inspired latent memory ODE for closure, a slow-manifold decoder of the form $g(q)+B(q)m$, and an RG-like coarse-graining loss enforcing approximate commutation between latent evolution and scale transformation. Multi-horizon rollout, semigroup, contraction, and geometry-preserving losses tie these components together into a single trainable framework for multiscale dynamical systems.
+> 当前仓库实现的是一个 `q/h` 慢快状态空间模型：`q` 通过 VAMP 风格目标学习慢坐标，`h` 通过 `q` 条件化仿射 SSM 承担快变量 / closure 状态，观测由 `g(q)+B(q)h` 解码，训练由重构、多步预测、latent 对齐、半群、时间尺度分离、谱对角化和 RG-like 一致性共同约束。它已经具备 hidden SSM 层面的 SSD-ready 结构，但还没有实现完整的 Mamba fused kernel。

@@ -8,8 +8,9 @@ class ModelConfig:
     input_dim: int
     context_len: int = 32
     q_dim: int = 2
-    m_dim: int = 2
-    latent_scheme: str = "hard_split"
+    h_dim: int = 2
+    m_dim: int | None = None
+    latent_scheme: str = "soft_spectrum"
     modal_dim: int = 8
     modal_temperature: float = 0.35
     encoder_type: str = "temporal_conv"
@@ -21,12 +22,24 @@ class ModelConfig:
     vamp_whitening_momentum: float = 0.05
     vamp_whitening_eps: float = 1e-5
     min_slow_rate: float = 0.02
-    min_memory_rate: float = 0.15
+    min_fast_rate: float = 0.15
+    min_memory_rate: float | None = None
+    hidden_operator_scale: float = 0.10
+    hidden_drive_scale: float = 0.50
+    slow_residual_scale: float = 0.50
     rg_scale: float = 2.0
     coarse_strength: float = 0.25
 
     def __post_init__(self) -> None:
         self.latent_scheme = str(self.latent_scheme).lower()
+        if self.m_dim is not None:
+            if int(self.h_dim) != int(self.m_dim):
+                if int(self.h_dim) != 2:
+                    raise ValueError("Pass either h_dim or m_dim, or keep them equal")
+                self.h_dim = int(self.m_dim)
+        if self.min_memory_rate is not None:
+            self.min_fast_rate = float(self.min_memory_rate)
+
         if self.latent_scheme not in {"hard_split", "soft_spectrum"}:
             raise ValueError("latent_scheme must be 'hard_split' or 'soft_spectrum'")
         if int(self.modal_dim) < 2:
@@ -35,11 +48,26 @@ class ModelConfig:
             raise ValueError("modal_temperature must be > 0")
         if int(self.q_dim) < 1:
             raise ValueError("q_dim must be >= 1")
-        if int(self.m_dim) < 1:
-            raise ValueError("m_dim must be >= 1")
+        if int(self.h_dim) < 1:
+            raise ValueError("h_dim must be >= 1")
+        if float(self.min_fast_rate) <= 0.0:
+            raise ValueError("min_fast_rate must be > 0")
+        if float(self.min_slow_rate) <= 0.0:
+            raise ValueError("min_slow_rate must be > 0")
+        if float(self.hidden_operator_scale) < 0.0:
+            raise ValueError("hidden_operator_scale must be >= 0")
+        if float(self.hidden_drive_scale) < 0.0:
+            raise ValueError("hidden_drive_scale must be >= 0")
+        if float(self.slow_residual_scale) < 0.0:
+            raise ValueError("slow_residual_scale must be >= 0")
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["h_dim"] = int(self.h_dim)
+        payload.pop("m_dim", None)
+        payload["min_fast_rate"] = float(self.min_fast_rate)
+        payload.pop("min_memory_rate", None)
+        return payload
 
 
 @dataclass
@@ -56,31 +84,53 @@ class LossConfig:
     contract_weight: float = 0.2
     rg_weight: float = 0.05
     metric_weight: float = 0.1
-    memory_l1_weight: float = 1e-4
+    hidden_l1_weight: float = 1e-4
+    memory_l1_weight: float | None = None
     separation_margin: float = 0.5
     contraction_margin: float = 0.10
 
+    def __post_init__(self) -> None:
+        if self.memory_l1_weight is not None:
+            self.hidden_l1_weight = float(self.memory_l1_weight)
+
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["hidden_l1_weight"] = float(self.hidden_l1_weight)
+        payload.pop("memory_l1_weight", None)
+        return payload
 
 
 @dataclass
 class SupervisionConfig:
     q_indices: tuple[int, ...] = ()
-    m_indices: tuple[int, ...] = ()
+    h_indices: tuple[int, ...] = ()
+    m_indices: tuple[int, ...] | None = None
     q_weight: float = 0.0
-    m_weight: float = 0.0
+    h_weight: float = 0.0
+    m_weight: float | None = None
     q_mode: str = "direct"
 
     def __post_init__(self) -> None:
         self.q_indices = tuple(int(idx) for idx in self.q_indices)
-        self.m_indices = tuple(int(idx) for idx in self.m_indices)
+        if self.m_indices is not None and not self.h_indices:
+            self.h_indices = tuple(int(idx) for idx in self.m_indices)
+        else:
+            self.h_indices = tuple(int(idx) for idx in self.h_indices)
+        if self.m_weight is not None and float(self.h_weight) == 0.0:
+            self.h_weight = float(self.m_weight)
         self.q_mode = str(self.q_mode).lower()
         if self.q_mode not in {"direct", "angular"}:
             raise ValueError("q_mode must be 'direct' or 'angular'")
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["q_indices"] = list(self.q_indices)
+        payload["h_indices"] = list(self.h_indices)
+        payload.pop("m_indices", None)
+        payload["q_weight"] = float(self.q_weight)
+        payload["h_weight"] = float(self.h_weight)
+        payload.pop("m_weight", None)
+        return payload
 
 
 @dataclass

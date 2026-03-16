@@ -30,7 +30,7 @@ from neural_dynamic_system import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train a q,m latent manifold + memory-kernel encoder on synthetic or file-based trajectories."
+        description="Train a q,h slow-memory latent dynamics model on synthetic or file-based trajectories."
     )
     parser.add_argument("--out_dir", type=str, default="runs/neural_dynamic_system/demo")
     parser.add_argument("--data_path", type=str, default=None, help="Optional .npy, .npz, or .csv trajectory path.")
@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_array_key", type=str, default=None, help="Optional NPZ label array key.")
     parser.add_argument("--window", type=int, default=32)
     parser.add_argument("--q_dim", type=int, default=2)
-    parser.add_argument("--m_dim", type=int, default=2)
-    parser.add_argument("--latent_scheme", type=str, default="hard_split", choices=["hard_split", "soft_spectrum"])
+    parser.add_argument("--h_dim", "--m_dim", dest="h_dim", type=int, default=2)
+    parser.add_argument("--latent_scheme", type=str, default="soft_spectrum", choices=["hard_split", "soft_spectrum"])
     parser.add_argument("--modal_dim", type=int, default=8)
     parser.add_argument("--modal_temperature", type=float, default=0.35)
     parser.add_argument("--encoder_type", type=str, default="temporal_conv", choices=["temporal_conv", "mlp"])
@@ -95,16 +95,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--separation_weight", type=float, default=0.2)
     parser.add_argument("--rg_weight", type=float, default=0.05)
     parser.add_argument("--metric_weight", type=float, default=0.1)
-    parser.add_argument("--memory_l1_weight", type=float, default=1e-4)
+    parser.add_argument("--hidden_l1_weight", "--memory_l1_weight", dest="hidden_l1_weight", type=float, default=1e-4)
     parser.add_argument("--contract_batch", type=int, default=16)
     parser.add_argument("--rg_horizon", type=int, default=1)
     parser.add_argument("--rg_scale", type=float, default=2.0)
     parser.add_argument("--coarse_strength", type=float, default=0.25)
     parser.add_argument("--q_label_indices", nargs="*", type=int, default=None)
-    parser.add_argument("--m_label_indices", nargs="*", type=int, default=None)
+    parser.add_argument("--h_label_indices", "--m_label_indices", dest="h_label_indices", nargs="*", type=int, default=None)
     parser.add_argument("--q_supervised_weight", type=float, default=0.0)
     parser.add_argument("--q_supervision_mode", type=str, default="direct", choices=["direct", "angular"])
-    parser.add_argument("--m_supervised_weight", type=float, default=0.0)
+    parser.add_argument("--h_supervised_weight", "--m_supervised_weight", dest="h_supervised_weight", type=float, default=0.0)
     parser.add_argument("--label_standardize", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--eval_batch_size", type=int, default=512)
     parser.add_argument("--phase1_fraction", type=float, default=None)
@@ -275,7 +275,7 @@ def _collect_latents(
     batch_size: int,
 ) -> dict[str, np.ndarray]:
     loader = DataLoader(dataset, batch_size=int(batch_size), shuffle=False)
-    outputs = {"q": [], "m": [], "z": []}
+    outputs = {"q": [], "h": [], "z": []}
     model.eval()
     with torch.no_grad():
         for batch in loader:
@@ -368,8 +368,8 @@ def _label_probe(
         "target_names": label_names,
         "latent_dims": {
             "q": int(model_cfg.q_dim),
-            "m": int(model_cfg.m_dim),
-            "z": int(model_cfg.q_dim + model_cfg.m_dim),
+            "h": int(model_cfg.h_dim),
+            "z": int(model_cfg.q_dim + model_cfg.h_dim),
         },
         "block_probe_r2": {},
     }
@@ -403,7 +403,7 @@ def main() -> None:
     label_stats = None
     supervision_cfg = None
     curriculum_cfg = _resolve_curriculum(args)
-    supervision_enabled = any(weight > 0.0 for weight in (args.q_supervised_weight, args.m_supervised_weight))
+    supervision_enabled = any(weight > 0.0 for weight in (args.q_supervised_weight, args.h_supervised_weight))
 
     if args.data_path:
         data_path = ROOT / args.data_path if not Path(args.data_path).is_absolute() else Path(args.data_path)
@@ -495,10 +495,10 @@ def main() -> None:
 
         total_label_dim = _episode_feature_dim(label_episodes)
         q_indices = _infer_indices(args.q_label_indices, start=0, block_dim=args.q_dim, total_dim=total_label_dim)
-        m_indices = _infer_indices(
-            args.m_label_indices,
+        h_indices = _infer_indices(
+            args.h_label_indices,
             start=len(q_indices),
-            block_dim=args.m_dim,
+            block_dim=args.h_dim,
             total_dim=total_label_dim,
         )
         splits = compute_episode_splits(
@@ -516,9 +516,9 @@ def main() -> None:
         )
         supervision_cfg = SupervisionConfig(
             q_indices=q_indices,
-            m_indices=m_indices,
+            h_indices=h_indices,
             q_weight=args.q_supervised_weight,
-            m_weight=args.m_supervised_weight,
+            h_weight=args.h_supervised_weight,
             q_mode=args.q_supervision_mode,
         )
 
@@ -526,7 +526,7 @@ def main() -> None:
         input_dim=input_dim,
         context_len=args.window,
         q_dim=args.q_dim,
-        m_dim=args.m_dim,
+        h_dim=args.h_dim,
         latent_scheme=args.latent_scheme,
         modal_dim=args.modal_dim,
         modal_temperature=args.modal_temperature,
@@ -568,7 +568,7 @@ def main() -> None:
         separation_weight=args.separation_weight,
         rg_weight=args.rg_weight,
         metric_weight=args.metric_weight,
-        memory_l1_weight=args.memory_l1_weight,
+        hidden_l1_weight=args.hidden_l1_weight,
     )
 
     result = fit_model(
@@ -656,7 +656,10 @@ def main() -> None:
     print(f"best val latent-align loss: {result.summary['best_val_latent_align_loss']:.6f}")
     print(f"best val semigroup loss: {result.summary['best_val_semigroup_loss']:.6f}")
     print(f"best val contract loss: {result.summary['best_val_contract_loss']:.6f}")
+    print(f"best val separation loss: {result.summary['best_val_separation_loss']:.6f}")
     print(f"best val rg loss: {result.summary['best_val_rg_loss']:.6f}")
+    print(f"best val memory rate mean: {result.summary['best_val_memory_rate_mean']:.6f}")
+    print(f"best val hidden spectral upper bound: {result.summary['best_val_hidden_sym_eig_upper']:.6f}")
     print(f"best val supervised loss: {result.summary['best_val_supervised_total_loss']:.6f}")
     print(f"last val rg loss: {result.summary['last_val_rg_loss']:.6f}")
     print(f"last val Koopman loss: {result.summary['last_val_koopman_loss']:.6f}")
@@ -665,6 +668,7 @@ def main() -> None:
         print(f"best phase-3 epoch: {result.summary['best_phase3_epoch']}")
         print(f"best phase-3 val Koopman loss: {result.summary['best_phase3_val_koopman_loss']:.6f}")
         print(f"best phase-3 val diagonalization loss: {result.summary['best_phase3_val_diag_loss']:.6f}")
+        print(f"best phase-3 val contract loss: {result.summary['best_phase3_val_contract_loss']:.6f}")
         print(f"best phase-3 val rg loss: {result.summary['best_phase3_val_rg_loss']:.6f}")
         print(f"best phase-3 val supervised loss: {result.summary['best_phase3_val_supervised_total_loss']:.6f}")
     if result.summary.get("latent_scheme") == "soft_spectrum":

@@ -203,36 +203,8 @@ def _semigroup_loss(
     return torch.stack(terms).mean()
 
 
-def _contract_loss(
-    model: LatentRGManifoldAutoencoder,
-    z0: Tensor,
-    memory_rates: Tensor,
-    *,
-    margin: float,
-    max_items: int,
-) -> Tensor:
-    count = min(int(z0.shape[0]), int(max_items))
-    if count <= 0:
-        return z0.new_tensor(0.0)
-
-    q, m = model.split_latent(z0[:count].detach())
-    q = q.detach()
-    m = m.detach().requires_grad_(True)
-    residual = model.memory_kernel(q, m)
-    jac_rows: list[Tensor] = []
-    for idx in range(model.cfg.m_dim):
-        grad_m = torch.autograd.grad(
-            residual[:, idx].sum(),
-            m,
-            retain_graph=True,
-            create_graph=True,
-        )[0]
-        jac_rows.append(grad_m)
-    jac = torch.stack(jac_rows, dim=1)
-    sym = 0.5 * (jac + jac.transpose(-1, -2))
-    max_sym_eig = torch.linalg.eigvalsh(sym).amax(dim=-1)
-    min_decay = memory_rates[:count].detach().amin(dim=-1) - float(margin)
-    return F.relu(max_sym_eig - min_decay).mean()
+def _memory_contract_loss(hidden_sym_eig_upper: Tensor, *, margin: float) -> Tensor:
+    return F.relu(hidden_sym_eig_upper + float(margin)).mean()
 
 
 def _phase_scales(phase: int) -> dict[str, float]:
@@ -352,6 +324,7 @@ def _loss_bundle(
     primary_horizon = train_cfg.horizons[0]
     lag_dt = float(train_cfg.dt) * float(primary_horizon)
     q1_vamp = future_components[primary_horizon]["q"]
+
     vamp_score = _vamp2_score(q0, q1_vamp)
     vamp_loss = -vamp_score / float(max(model.cfg.q_dim, 1))
     diag_loss = _offdiag_frobenius_loss(_time_lag_covariance(q0, q1_vamp))
@@ -375,16 +348,15 @@ def _loss_bundle(
     memory_scale = stats0["memory_rates"].mean(dim=-1, keepdim=True)
     sep_gap = memory_scale - slow_scale
     separation_loss = F.relu(loss_cfg.separation_margin - sep_gap).mean()
-    contract_loss = _contract_loss(
-        model,
-        z0,
-        stats0["memory_rates"],
+    contract_loss = _memory_contract_loss(
+        stats0["hidden_sym_eig_upper"],
         margin=loss_cfg.contraction_margin,
-        max_items=train_cfg.contract_batch,
     )
 
-    memory_penalty = stats0["m"].abs().mean()
-    memory_kernel_mag = model.memory_kernel(stats0["q"], stats0["m"]).abs().mean()
+    memory_penalty = stats0["h"].abs().mean()
+    memory_drive_mag = stats0["hidden_drive"].abs().mean()
+    hidden_sym_eig_upper = stats0["hidden_sym_eig_upper"].mean()
+    slow_residual_mag = stats0["slow_residual"].abs().mean()
 
     if loss_cfg.rg_weight > 0.0 and phase_scale["rg"] > 0.0:
         coarse_after_fine = model.coarse_grain(model.flow(z0, dt=train_cfg.dt, steps=train_cfg.rg_horizon))
@@ -410,15 +382,15 @@ def _loss_bundle(
         indices=(supervision_cfg.q_indices if supervision_cfg is not None else ()),
         mode=(supervision_cfg.q_mode if supervision_cfg is not None else "direct"),
     )
-    m_supervised_loss = _supervised_component_loss(
-        current_comp["m"],
-        {horizon: comp["m"] for horizon, comp in future_components.items()},
+    h_supervised_loss = _supervised_component_loss(
+        current_comp["h"],
+        {horizon: comp["h"] for horizon, comp in future_components.items()},
         batch=batch,
-        indices=(supervision_cfg.m_indices if supervision_cfg is not None else ()),
+        indices=(supervision_cfg.h_indices if supervision_cfg is not None else ()),
     )
     supervised_total_loss = (
         (float(supervision_cfg.q_weight) * q_supervised_loss if supervision_cfg is not None else zero)
-        + (float(supervision_cfg.m_weight) * m_supervised_loss if supervision_cfg is not None else zero)
+        + (float(supervision_cfg.h_weight) * h_supervised_loss if supervision_cfg is not None else zero)
     )
 
     total = (
@@ -434,7 +406,7 @@ def _loss_bundle(
         + (loss_cfg.separation_weight * phase_scale["separation"]) * separation_loss
         + (loss_cfg.rg_weight * phase_scale["rg"]) * rg_loss
         + loss_cfg.metric_weight * metric_loss
-        + loss_cfg.memory_l1_weight * memory_penalty
+        + loss_cfg.hidden_l1_weight * memory_penalty
         + supervised_total_loss
     )
     return {
@@ -452,10 +424,16 @@ def _loss_bundle(
         "separation_loss": separation_loss,
         "rg_loss": rg_loss,
         "metric_loss": metric_loss,
+        "hidden_l1_loss": memory_penalty,
         "memory_l1_loss": memory_penalty,
-        "memory_kernel_mag": memory_kernel_mag,
+        "memory_drive_mag": memory_drive_mag,
+        "hidden_sym_eig_upper": hidden_sym_eig_upper,
+        "slow_rate_mean": slow_scale.mean(),
+        "memory_rate_mean": memory_scale.mean(),
+        "slow_residual_mag": slow_residual_mag,
         "q_supervised_loss": q_supervised_loss,
-        "m_supervised_loss": m_supervised_loss,
+        "h_supervised_loss": h_supervised_loss,
+        "m_supervised_loss": h_supervised_loss,
         "supervised_total_loss": supervised_total_loss,
     }
 
@@ -510,7 +488,7 @@ def fit_model(
     _seed_everything(int(train_cfg.seed))
     device = _resolve_device(train_cfg.device)
     if supervision_cfg is not None and (
-        supervision_cfg.q_weight > 0.0 or supervision_cfg.m_weight > 0.0
+        supervision_cfg.q_weight > 0.0 or supervision_cfg.h_weight > 0.0
     ) and labels is None:
         raise ValueError("supervision_cfg has positive weights but no labels were provided")
     train_ds, val_ds, stats = prepare_datasets(
@@ -585,7 +563,8 @@ def fit_model(
                 f"align={val_metrics['latent_align_loss']:.5f} "
                 f"sg={val_metrics['semigroup_loss']:.5f} "
                 f"contract={val_metrics['contract_loss']:.5f} "
-                f"sup={val_metrics['supervised_total_loss']:.5f}"
+                f"gap={val_metrics['separation_loss']:.5f} "
+                f"mem={val_metrics['hidden_l1_loss']:.5f}"
             )
 
     history = pd.DataFrame(history_rows)
@@ -601,6 +580,7 @@ def fit_model(
     else:
         best_phase3_row = None
     model.load_state_dict(best_state_by_phase.get(highest_phase, best_state_by_phase[min(best_state_by_phase)]))
+
     summary: dict[str, object] = {
         "device": str(device),
         "train_episodes": int(len(train_ds.episodes)),
@@ -610,7 +590,7 @@ def fit_model(
         "rg_enabled": bool(loss_cfg.rg_weight > 0.0),
         "supervision_enabled": bool(
             supervision_cfg is not None
-            and (supervision_cfg.q_weight > 0.0 or supervision_cfg.m_weight > 0.0)
+            and (supervision_cfg.q_weight > 0.0 or supervision_cfg.h_weight > 0.0)
         ),
         "latent_scheme": str(model.cfg.latent_scheme),
         "selection_phase": int(highest_phase),
@@ -626,9 +606,14 @@ def fit_model(
         "best_val_latent_align_loss": float(best_val_row["latent_align_loss"]),
         "best_val_semigroup_loss": float(best_val_row["semigroup_loss"]),
         "best_val_contract_loss": float(best_val_row["contract_loss"]),
+        "best_val_separation_loss": float(best_val_row["separation_loss"]),
         "best_val_rg_loss": float(best_val_row["rg_loss"]),
+        "best_val_hidden_l1_loss": float(best_val_row["hidden_l1_loss"]),
+        "best_val_memory_rate_mean": float(best_val_row["memory_rate_mean"]),
+        "best_val_slow_rate_mean": float(best_val_row["slow_rate_mean"]),
+        "best_val_hidden_sym_eig_upper": float(best_val_row["hidden_sym_eig_upper"]),
         "best_val_q_supervised_loss": float(best_val_row["q_supervised_loss"]),
-        "best_val_m_supervised_loss": float(best_val_row["m_supervised_loss"]),
+        "best_val_h_supervised_loss": float(best_val_row["h_supervised_loss"]),
         "best_val_supervised_total_loss": float(best_val_row["supervised_total_loss"]),
         "best_epoch": int(best_val_row["epoch"]),
         "last_epoch": int(last_val_row["epoch"]),
@@ -638,6 +623,10 @@ def fit_model(
         "last_val_prediction_loss": float(last_val_row["prediction_loss"]),
         "last_val_semigroup_loss": float(last_val_row["semigroup_loss"]),
         "last_val_rg_loss": float(last_val_row["rg_loss"]),
+        "last_val_contract_loss": float(last_val_row["contract_loss"]),
+        "last_val_separation_loss": float(last_val_row["separation_loss"]),
+        "last_val_memory_rate_mean": float(last_val_row["memory_rate_mean"]),
+        "last_val_hidden_sym_eig_upper": float(last_val_row["hidden_sym_eig_upper"]),
         "last_val_supervised_total_loss": float(last_val_row["supervised_total_loss"]),
         "best_phase3_epoch": (int(best_phase3_row["epoch"]) if best_phase3_row is not None else None),
         "best_phase3_val_loss": (float(best_phase3_row["loss"]) if best_phase3_row is not None else None),
@@ -646,6 +635,9 @@ def fit_model(
         "best_phase3_val_prediction_loss": (float(best_phase3_row["prediction_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_semigroup_loss": (float(best_phase3_row["semigroup_loss"]) if best_phase3_row is not None else None),
         "best_phase3_val_rg_loss": (float(best_phase3_row["rg_loss"]) if best_phase3_row is not None else None),
+        "best_phase3_val_contract_loss": (float(best_phase3_row["contract_loss"]) if best_phase3_row is not None else None),
+        "best_phase3_val_separation_loss": (float(best_phase3_row["separation_loss"]) if best_phase3_row is not None else None),
+        "best_phase3_val_hidden_sym_eig_upper": (float(best_phase3_row["hidden_sym_eig_upper"]) if best_phase3_row is not None else None),
         "best_phase3_val_supervised_total_loss": (float(best_phase3_row["supervised_total_loss"]) if best_phase3_row is not None else None),
     }
     summary.update(model.spectrum_summary())
