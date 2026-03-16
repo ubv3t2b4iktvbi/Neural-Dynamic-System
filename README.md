@@ -1,5 +1,47 @@
 # Neural Dynamic System
 
+目标：从时间序列中学出一个可解释的慢快动力学模型，把观测分解成 `Koopman slow state q + hidden fast memory h`，用于重构、预测和 RG/semigroup 一致性约束。
+
+## 模型架构图
+
+```mermaid
+flowchart LR
+    W["输入窗口 W_t"] --> E["Encoder E"]
+    E --> UQ["slow summary u_t^(q)"]
+    E --> UH["fast summary u_t^(h)"]
+
+    UQ --> K["Koopman head K_theta"]
+    UH -. "soft_spectrum 时也输入" .-> K
+    K --> PRAW["raw Koopman features phi_t^raw"]
+    PRAW --> N["running whitening / channel norm"]
+    N --> PHI["Koopman features phi_t"]
+
+    PHI --> Q["q_t = phi_t[:d_q]"]
+    PHI --> PF["phi_t^fast"]
+    UH --> HINIT["h head H_theta([u_t^(h), phi_t^fast])"]
+    PF --> HINIT
+    HINIT --> H["h_t"]
+
+    subgraph STEP["一步 rollout"]
+        Q --> QSTEP["q: midpoint / RK2"]
+        H --> QSTEP
+        Q --> HGEN["A(q), b(q)"]
+        HGEN --> HSTEP["h: exact affine / exp step"]
+        H --> HSTEP
+    end
+
+    QSTEP --> ZNEXT["z_(t+1) = (q_(t+1), h_(t+1))"]
+    HSTEP --> ZNEXT
+    ZNEXT --> DEC["decoder: g(q) + D(q) h"]
+    DEC --> XH["重构 / 预测 x_hat"]
+
+    ZNEXT --> RG["RG branch only"]
+    RG --> RGQ["q_tilde = sqrt(lambda_q) * q"]
+    RG --> RGH["h_tilde = H_damp(q)^(-1/2) h"]
+    RGQ --> CG["coarse-grain C_s"]
+    RGH --> CG
+```
+
 这个 README 只描述当前代码里真实实现的模型，不沿用旧的 `q,m` 文案。
 
 当前实现的核心是：
@@ -59,46 +101,6 @@ $$
 $$
 z_t = (q_t, h_t)
 $$
-
-### Mermaid 结构图
-
-```mermaid
-flowchart LR
-    W["输入窗口 W_t"] --> E["Encoder E"]
-    E --> UQ["slow summary u_t^(q)"]
-    E --> UH["fast summary u_t^(h)"]
-
-    UQ --> K["Koopman head K_theta"]
-    UH -. "soft_spectrum 时也输入" .-> K
-    K --> PRAW["raw Koopman features phi_t^raw"]
-    PRAW --> N["running whitening / channel norm"]
-    N --> PHI["Koopman features phi_t"]
-
-    PHI --> Q["q_t = phi_t[:d_q]"]
-    PHI --> PF["phi_t^fast"]
-    UH --> HINIT["h head H_theta([u_t^(h), phi_t^fast])"]
-    PF --> HINIT
-    HINIT --> H["h_t"]
-
-    subgraph STEP["一步 rollout"]
-        Q --> QSTEP["q: midpoint / RK2"]
-        H --> QSTEP
-        Q --> HGEN["A(q), b(q)"]
-        HGEN --> HSTEP["h: exact affine / exp step"]
-        H --> HSTEP
-    end
-
-    QSTEP --> ZNEXT["z_(t+1) = (q_(t+1), h_(t+1))"]
-    HSTEP --> ZNEXT
-    ZNEXT --> DEC["decoder: g(q) + D(q) h"]
-    DEC --> XH["重构 / 预测 x_hat"]
-
-    ZNEXT --> RG["RG branch only"]
-    RG --> RGQ["q_tilde = sqrt(lambda_q) * q"]
-    RG --> RGH["h_tilde = H_damp(q)^(-1/2) h"]
-    RGQ --> CG["coarse-grain C_s"]
-    RGH --> CG
-```
 
 补充说明：
 
