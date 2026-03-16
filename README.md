@@ -245,11 +245,11 @@ $$
 $$
 
 $$
-H_{\text{damp}}(q) = - \frac{A(q) + A(q)^T}{2}
+H_{damp}(q) = - \frac{A(q) + A(q)^T}{2}
 $$
 
 $$
-\tilde h = H_{\text{damp}}(q)^{-1/2} h
+\tilde h = H_{damp}(q)^{-1/2} h
 $$
 
 这一步的目的只是让不同时间尺度的量在同一个尺度下比较。
@@ -292,7 +292,7 @@ $$
 $$
 
 再通过 `sigmoid` 做 soft mask。
-对 `h` 的 coarse-graining 仍然是在 RG 坐标里做 `\tilde h' = \tilde h / s`，然后再通过 `H_{\text{damp}}(q)^{1/2}` 映回原始 hidden 坐标。
+对 `h` 的 coarse-graining 仍然是在 RG 坐标里做 `\tilde h' = \tilde h / s`，然后再通过 `H_{damp}(q)^{1/2}` 映回原始 hidden 坐标。
 
 RG loss 比较的是：
 
