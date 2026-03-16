@@ -40,6 +40,7 @@ $$
 $$
 
 这里 `phi_t` 的维度是 `koopman_dim`。
+在当前代码里，这一步更准确地说是 running mean 加按通道方差归一化，用来尽量保留 Koopman 模态顺序。
 
 慢变量不是单独再学一套完全独立的向量，而是直接取 Koopman 特征的 slow 子空间：
 
@@ -58,6 +59,52 @@ $$
 $$
 z_t = (q_t, h_t)
 $$
+
+### Mermaid 结构图
+
+```mermaid
+flowchart LR
+    W["输入窗口 W_t"] --> E["Encoder E"]
+    E --> UQ["slow summary u_t^(q)"]
+    E --> UH["fast summary u_t^(h)"]
+
+    UQ --> K["Koopman head K_theta"]
+    UH -. "soft_spectrum 时也输入" .-> K
+    K --> PRAW["raw Koopman features phi_t^raw"]
+    PRAW --> N["running whitening / channel norm"]
+    N --> PHI["Koopman features phi_t"]
+
+    PHI --> Q["q_t = phi_t[:d_q]"]
+    PHI --> PF["phi_t^fast"]
+    UH --> HINIT["h head H_theta([u_t^(h), phi_t^fast])"]
+    PF --> HINIT
+    HINIT --> H["h_t"]
+
+    subgraph STEP["一步 rollout"]
+        Q --> QSTEP["q: midpoint / RK2"]
+        H --> QSTEP
+        Q --> HGEN["A(q), b(q)"]
+        HGEN --> HSTEP["h: exact affine / exp step"]
+        H --> HSTEP
+    end
+
+    QSTEP --> ZNEXT["z_(t+1) = (q_(t+1), h_(t+1))"]
+    HSTEP --> ZNEXT
+    ZNEXT --> DEC["decoder: g(q) + D(q) h"]
+    DEC --> XH["重构 / 预测 x_hat"]
+
+    ZNEXT --> RG["RG branch only"]
+    RG --> RGQ["q_tilde = sqrt(lambda_q) * q"]
+    RG --> RGH["h_tilde = H_damp(q)^(-1/2) h"]
+    RGQ --> CG["coarse-grain C_s"]
+    RGH --> CG
+```
+
+补充说明：
+
+- `hard_split` 时，Koopman 头只看 `u_t^(q)`；`soft_spectrum` 时，Koopman 头看 `[u_t^(q), u_t^(h)]`。
+- `h` 的初始化来自 `fast_hidden` 和 Koopman 特征；`q` 则直接取 Koopman 特征的前 `q_dim` 维。
+- RG 坐标只用于 RG loss 分支，不参与主干 encoder、主干 rollout 和主干 decoder。
 
 ## 代码里的最终动力学
 
@@ -194,14 +241,19 @@ $$
 但在 RG 分支里，代码先做一个专用坐标变换：
 
 $$
-\tilde q = sqrt(\lambda_q) \odot q
+\tilde q = \sqrt{\lambda_q} \odot q
 $$
 
 $$
-\tilde h = h / sqrt(r_h(q))
+H_{\text{damp}}(q) = - \frac{A(q) + A(q)^T}{2}
+$$
+
+$$
+\tilde h = H_{\text{damp}}(q)^{-1/2} h
 $$
 
 这一步的目的只是让不同时间尺度的量在同一个尺度下比较。
+也就是说，当前 `h` 的 RG 归一化不再是逐维 `1 / \sqrt{r_h(q)}`，而是按 hidden operator 的对称阻尼度量做矩阵归一化。
 
 它不应该被强行塞进主 encoder、主 rollout、主 decoder 里，否则整个模型都会被 RG 坐标绑架，重构与预测会更难训，解释也会变差。
 
@@ -240,6 +292,7 @@ $$
 $$
 
 再通过 `sigmoid` 做 soft mask。
+对 `h` 的 coarse-graining 仍然是在 RG 坐标里做 `\tilde h' = \tilde h / s`，然后再通过 `H_{\text{damp}}(q)^{1/2}` 映回原始 hidden 坐标。
 
 RG loss 比较的是：
 

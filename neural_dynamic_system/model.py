@@ -29,11 +29,18 @@ def _group_count(channels: int, max_groups: int = 8) -> int:
     return 1
 
 
-def _matrix_inv_sqrt(mat: Tensor, eps: float = 1e-5) -> Tensor:
+def _matrix_sym_power(mat: Tensor, power: float, eps: float = 1e-5) -> Tensor:
     evals, evecs = torch.linalg.eigh(mat)
-    evals = evals.clamp_min(eps)
-    inv_sqrt = evals.rsqrt()
-    return (evecs * inv_sqrt.unsqueeze(0)) @ evecs.transpose(-1, -2)
+    scaled = evals.clamp_min(eps).pow(power)
+    return (evecs * scaled.unsqueeze(-2)) @ evecs.transpose(-1, -2)
+
+
+def _matrix_inv_sqrt(mat: Tensor, eps: float = 1e-5) -> Tensor:
+    return _matrix_sym_power(mat, power=-0.5, eps=eps)
+
+
+def _matrix_sqrt(mat: Tensor, eps: float = 1e-5) -> Tensor:
+    return _matrix_sym_power(mat, power=0.5, eps=eps)
 
 
 def _softplus_inverse(value: float) -> float:
@@ -96,8 +103,10 @@ class RunningWhitenedVAMP(nn.Module):
             cov = self.running_cov.to(device=raw.device, dtype=raw.dtype)
         else:
             mean, cov = self._batch_stats(raw.detach())
-        whitening = _matrix_inv_sqrt(cov, eps=self.eps).detach()
-        q = (raw - mean.detach()) @ whitening
+        # Preserve the learned modal ordering by normalizing each channel
+        # independently instead of mixing coordinates with a full whitener.
+        inv_std = torch.diagonal(cov, dim1=-2, dim2=-1).clamp_min(self.eps).rsqrt().detach()
+        q = (raw - mean.detach()) * inv_std
         return q, raw
 
 
@@ -262,7 +271,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
             "integrator": "midpoint_q_plus_exact_affine_h",
             "koopman_dim": int(self.koopman_dim),
             "hidden_rank": int(self.hidden_rank),
-            "rg_transform": "rate_normalized_qh",
+            "rg_transform": "q_rate_normalized_plus_hidden_sym_damping",
             "hidden_operator_structure": "diagonal_plus_low_rank",
         }
         with torch.no_grad():
@@ -470,19 +479,27 @@ class LatentRGManifoldAutoencoder(nn.Module):
 
     def rg_transform(self, z: Tensor) -> dict[str, Tensor]:
         q, h = self.split_latent(z)
-        fast_rates = self.cfg.min_fast_rate + F.softplus(self.h_rate_net(q))
+        hidden_operator, fast_rates, hidden_low_rank_coeffs, hidden_sym_eig_upper = self._hidden_operator(q)
+        hidden_sym = 0.5 * (hidden_operator + hidden_operator.transpose(-1, -2))
+        hidden_damping = -hidden_sym
+        h_transform = _matrix_inv_sqrt(hidden_damping, eps=float(self.cfg.rg_eps))
+        h_inverse_transform = _matrix_sqrt(hidden_damping, eps=float(self.cfg.rg_eps))
         q_rates = self.slow_koopman_rates().to(device=q.device, dtype=q.dtype).unsqueeze(0).expand_as(q)
         q_scale = q_rates.clamp_min(float(self.cfg.rg_eps)).sqrt()
-        h_scale = fast_rates.clamp_min(float(self.cfg.rg_eps)).sqrt()
         rg_q = q * q_scale
-        rg_h = h / h_scale
+        rg_h = torch.bmm(h.unsqueeze(1), h_transform).squeeze(1)
         return {
             "q": q,
             "h": h,
             "fast_rates": fast_rates,
+            "hidden_operator": hidden_operator,
+            "hidden_low_rank_coeffs": hidden_low_rank_coeffs,
+            "hidden_sym_eig_upper": hidden_sym_eig_upper,
+            "hidden_damping": hidden_damping,
             "q_rates": q_rates,
             "q_scale": q_scale,
-            "h_scale": h_scale,
+            "h_transform": h_transform,
+            "h_inverse_transform": h_inverse_transform,
             "rg_q": rg_q,
             "rg_h": rg_h,
         }
@@ -500,7 +517,7 @@ class LatentRGManifoldAutoencoder(nn.Module):
         coarse_rg_q = slow_mask * rg["rg_q"] + delta_q
         coarse_rg_h = rg["rg_h"] / scale
         coarse_q = coarse_rg_q / rg["q_scale"]
-        coarse_h = coarse_rg_h * rg["h_scale"]
+        coarse_h = torch.bmm(coarse_rg_h.unsqueeze(1), rg["h_inverse_transform"]).squeeze(1)
         return self.join_latent(coarse_q, coarse_h)
 
     def module_groups(self) -> dict[str, list[nn.Module]]:

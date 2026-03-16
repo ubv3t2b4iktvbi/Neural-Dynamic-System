@@ -159,7 +159,7 @@ class TrainConfig:
     weight_decay: float = 1e-5
     train_fraction: float = 0.8
     horizons: tuple[int, ...] = (10, 20, 40, 80)
-    dt: float = 1.0
+    dt: float = 0.05
     grad_clip: float = 1.0
     device: str = "auto"
     metric_subsample: int = 32
