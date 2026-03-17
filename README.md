@@ -1,5 +1,17 @@
 # Neural Dynamic System
 
+## Theory Roadmap (2026-03-17)
+
+Theory-first planning for the next architecture family is documented in:
+
+- `docs/closure_first_flag_information_blueprint_20260317.md`
+- `docs/theory_closure_audit_20260317.md`
+- `docs/stage_capability_gap_blueprint.md`
+
+The new blueprint is intentionally ahead of the current implementation.
+It describes a closure-first, chart-routed, flag-structured model with information-aware block promotion, merge, and prune decisions.
+Use that document as the design reference before changing `model.py`, `training.py`, or the synthetic smoke suite.
+
 目标：从时间序列中学出一个可解释的慢快动力学模型，把观测分解成 `Koopman slow state q + hidden fast memory h`，用于重构、预测和 RG/semigroup 一致性约束。
 
 这个 README 只描述当前代码里真实实现的模型，不沿用旧的 `q,m` 文案。
