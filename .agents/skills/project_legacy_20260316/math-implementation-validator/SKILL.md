@@ -20,15 +20,23 @@ Turn mathematical code review into a short evidence loop: map code to formulas, 
    - read [the operator checklist](references/operator-audit-checklist.md) for gradients, Jacobians, Hessians, divergences, curls, Laplacians, convolutions, normalizations, or time-steppers;
    - check sign conventions, transpose or index order, boundary handling, epsilon placement, detach or stop-gradient behavior, and units or scale factors;
    - compare the implemented discrete operator against the intended continuous or discrete form, not just against variable names.
-4. Choose the smallest convincing oracle:
+4. Check for skipped derivation steps and hidden feasibility assumptions:
+   - explicitly ask whether each inverse, projection, Jacobian, Hessian, eigendecomposition, or higher-order derivative is numerically stable and actually computable in the current model;
+   - call out missing parameterizations, circular dependencies, implicit equations that were treated as explicit, and losses that require quantities the model does not expose;
+   - distinguish "formally well-defined on paper" from "closed and trainable with the available architecture, data, and autodiff budget".
+5. Balance closure against learned approximation complexity:
+   - allow a neural surrogate only when the analytically unclosed piece is clearly identified and its approximation target is explicit;
+   - trace how surrogate error propagates into downstream quantities, and check that stability-critical objects such as projections, contraction rates, or semigroup tests are not invalidated by that error;
+   - prefer the lowest-complexity approximation that keeps the rest of the computation trustworthy, and say when an exact formula should remain non-learned.
+6. Choose the smallest convincing oracle:
    - prefer a closed-form case when one exists;
    - otherwise use finite differences, complex-step checks, symmetry or invariance checks, conservation laws, manufactured solutions, or autograd parity;
    - read [the test patterns reference](references/test-patterns.md) when the best oracle is unclear.
-5. Implement focused tests:
+7. Implement focused tests:
    - start with one deterministic fixture that exposes the operator clearly;
    - add one perturbation or randomized property test only if it checks a different failure mode;
    - keep tolerances explicit and justify them from conditioning, discretization error, or dtype limits.
-6. Report for expert review:
+8. Report for expert review:
    - separate confirmed matches, suspected mismatches, and assumptions that remain unproven;
    - include the code-to-formula translation, operator-audit findings, chosen oracle, and residual risk;
    - if tests were not run, say exactly what remains unverified and what fixture should be added next.
@@ -42,6 +50,8 @@ Turn mathematical code review into a short evidence loop: map code to formulas, 
 ## Guardrails
 - Do not claim a mathematical proof from passing numerical tests alone.
 - Do not stop at "the shapes match"; verify axes, reductions, broadcasting, and semantics.
+- Do not stop at a paper-level derivation; check whether each object is actually realizable, differentiable, and numerically stable in the current implementation.
+- Do not replace a hard-constraint object with a neural approximation unless you can explain why the induced error will not break the surrounding computation.
 - Do not compare autograd against itself when an independent oracle is available.
 - Do not broaden into full refactors before pinning down the target operator and failure mode.
 - Prefer the narrowest reproducible fixture over large end-to-end pipelines.

@@ -36,6 +36,14 @@ Use this skill to turn repeated "stage goal vs model ability" discussions into i
    - repo-backed
    - hypothesis needing validation
 5. Do not skip directly to a custom neural solution when a mature algorithm can first narrow the hypothesis space.
+6. Before numerical validation, write the strongest non-overclaiming theory statement the current model family can support:
+   - what object the model claims to recover
+   - which weaker proxy it actually learns if the full object is not identifiable
+   - which claims are only valid for multi-response shared-driver data versus single-sequence data
+7. When the system structure is unknown, treat a single global latent family as a hypothesis rather than a default:
+   - compare routed or piecewise family explanations before locking in one chart
+   - consider mixture-of-charts, operator-family routing, or regime dispatch ahead of stronger theorem claims
+   - do not let an intra-state channel mixer stand in for structural routing
 
 ## Gap -> Path -> Feasibility Workflow
 1. Identify the exact gap between the current stage and the next stage:
@@ -152,9 +160,13 @@ If a step cannot be written in this format, it is not mature enough to become pa
 ## Guardrails
 - Do not start from private intuition alone; start from theory papers, algorithm papers, empirical validations, and review conclusions.
 - Do not present a hypothesis as a conclusion until it survives an explicit theory -> experiment -> conclusion loop.
+- Do not let experiments choose the claim after the fact; first name the mathematical object being tested, then design the validation.
 - Do not turn on strong geometry or semigroup losses before closure evidence exists.
 - Do not call a driven hidden state a fiber unless `h=0` is approximately invariant or explicitly recentered to an invariant offset.
 - Do not treat a rate gap alone as proof of fast-slow separation.
+- Do not promote a single-sequence latent state into a Sauer-style shared driver or shared semiconjugate factor unless the data actually contain multiple responses with a common driver and the objective includes an explicit shared-response coupling.
+- Do not call `q` an exact Koopman eigenfunction, or `h` an exact slow manifold or fiber coordinate, unless the model family and diagnostics identify those stronger objects rather than only an approximate latent SSM coordinate.
+- When the structure is unknown, do not rely on channel mixing alone; routing must happen at the chart, operator-family, or branch-selection level if the goal is automatic regime separation.
 - Do not reset training from scratch when checkpoint surgery, gating, freezing, or a narrow fine-tune can preserve prior work.
 - Preserve CLI flags, config serialization, summary keys, and checkpoint compatibility when surfacing new structure.
 
